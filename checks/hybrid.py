@@ -949,6 +949,81 @@ def test_hybrid_decoding_mamba2_route(device='cpu'):
     ]
 
 
+def test_hybrid_end_to_end_determinism(device='cpu'):
+    """End-to-end determinism + production smoke for the hybrid stack.
+
+    Production requirement: given the same seed and input, a full
+    KDA+CSA+HCA forward + backward + optimizer step must be bitwise
+    deterministic and produce finite outputs/grads/updated params with
+    the expected shape. This closes the gap between per-operator
+    regression checks and an actual training step: a single
+    non-deterministic op or a silent NaN in the loss would corrupt a
+    whole production run without any individual operator check firing.
+    """
+    import torch.optim as optim
+    torch.manual_seed(1234)
+    cfg = HybridConfig(
+        d_model=32, n_heads_qk=2, n_heads_v=2,
+        head_dim_k=16, head_dim_v=16,
+        csa_m=8, csa_topk=4, csa_nh=2, csa_c=16, csa_dc=32, csa_nIh=2, csa_cI=8,
+        csa_sliding_window=8,
+        hca_m2=16, hca_nh=2, hca_c=16, hca_dc=32, hca_sliding_window=8,
+        n_kda=3, n_csa=1, n_hca=1,
+    )
+    B, T = 2, 64
+
+    def build_and_train_step():
+        model = HybridKCHAttention(cfg, total_layers=5).to(device)
+        model.train()
+        model.reset_state()
+        x = torch.randn(B, T, cfg.d_model, device=device) * 0.1
+        target = torch.randn(B, T, cfg.d_model, device=device) * 0.1
+        y = model(x)
+        loss = ((y - target) ** 2).mean()
+        loss.backward()
+        optim.SGD(model.parameters(), lr=1e-3).step()
+        return y, loss, model
+
+    y1, loss1, m1 = build_and_train_step()
+    # Re-seed identically: init + forward + backward + step must be
+    # bitwise reproducible across two independent training steps.
+    torch.manual_seed(1234)
+    y2, loss2, m2 = build_and_train_step()
+
+    def grads(model):
+        return {n: p.grad for n, p in model.named_parameters()
+                if p.grad is not None}
+
+    g1, g2 = grads(m1), grads(m2)
+    grads_same_names = set(g1) == set(g2)
+    grads_det = grads_same_names and all(
+        torch.equal(g1[n], g2[n]) for n in g1)
+    params_det = all(
+        torch.equal(p1, p2)
+        for p1, p2 in zip(m1.parameters(), m2.parameters()))
+    finite = (
+        torch.isfinite(y1).all().item()
+        and torch.isfinite(loss1).item()
+        and all(torch.isfinite(p.grad).all().item()
+                for p in m1.parameters() if p.grad is not None)
+        and all(torch.isfinite(p).all().item() for p in m1.parameters()))
+    shape_ok = y1.shape == (B, T, cfg.d_model)
+
+    return [
+        _ok('hybrid end-to-end forward deterministic (bitwise)',
+            torch.equal(y1, y2), f'y1.shape={tuple(y1.shape)}'),
+        _ok('hybrid end-to-end loss deterministic', loss1 == loss2,
+            f'loss1={float(loss1.detach()):.6e} loss2={float(loss2.detach()):.6e}'),
+        _ok('hybrid end-to-end grads deterministic (bitwise)', grads_det,
+            f'same_param_names={grads_same_names}'),
+        _ok('hybrid end-to-end updated params deterministic (bitwise)',
+            params_det, ''),
+        _ok('hybrid end-to-end all outputs/grads/params finite', finite, ''),
+        _ok('hybrid end-to-end output shape', shape_ok,
+            f'got={tuple(y1.shape)} expected=({B},{T},{cfg.d_model})'),
+    ]
+
+
 __all__ = [
     'test_fused_hybrid',
     'test_csa_recompute_indexer_plumbing',
@@ -966,4 +1041,5 @@ __all__ = [
     'test_hybrid_decoding_cache_matches_full_sequence',
     'test_hybrid_streaming_tp_matches_unsharded',
     'test_hybrid_decoding_mamba2_route',
+    'test_hybrid_end_to_end_determinism',
 ]

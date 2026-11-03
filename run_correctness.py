@@ -142,6 +142,9 @@ def main():
     all_results += _run_safe(test_kda_initial_state_dtype_mismatch, device)
     # Regression test for hybrid backward gradient flow.
     all_results += _run_safe(test_hybrid_backward_produces_grads, device)
+    # End-to-end integration smoke: same seed -> bitwise deterministic
+    # forward/backward/step, finite outputs/grads/params, correct shape.
+    all_results += _run_safe(test_hybrid_end_to_end_determinism, device)
     # Additional edge-case tests for broader coverage.
     all_results += _run_safe(test_csa_hca_bf16_dtype_consistency, device)
     all_results += _run_safe(test_csa_hca_no_sink_no_sliding_window, device)
