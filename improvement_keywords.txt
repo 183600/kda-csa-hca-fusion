@@ -1,100 +1,100 @@
+linear attention
+delta rule
+recurrent state
+per-channel gating
+forget gate
+log-decay gate
 KDA
+Kimi Delta Attention
+Gated DeltaNet
+KV compression
+softmax-weighted compression
+block-wise compression
+overlapped compression
+two-branch compression
 CSA
-HCA
-DeltaAttention
-LinearAttention
-CompressedSparseAttention
-HeavilyCompressedAttention
+Compressed Sparse Attention
 DeepSeek-V4
-KVCompression
-SparseAttention
-MQA
-GQA
-PerChannelGating
-ForgetGate
-DeltaRule
-RecurrentState
-StateSpaceModel
-RWKV
-RetNet
-Mamba
+lightning indexer
+low-rank projection
+top-k selection
+sparse attention
+shared-KV MQA
+multi-query attention
+grouped-query attention
+GVA
+HCA
+Heavily Compressed Attention
+heavy compression
+dense attention
+sliding window attention
+local attention
+attention sink
+virtual token
+partial RoPE
+rotary positional embedding
+DPLR
+diagonal plus low rank
+associative scan
+Hillis-Steele scan
+prefix scan
+parallel scan
+torch.compile
+TorchScript
+JIT compilation
+bfloat16
+float16
+numerical stability
+NaN guard
+Inf guard
+online softmax
+chunked scan
+chunked attention
+chunkwise parallel
+recurrent path
+state-space duality
+SSD
 SSM
-HybridAttention
-SlidingWindow
-AttentionSink
-RoPE
-PartialRoPE
-BF16
-MixedPrecision
-NumericalStability
-SoftmaxClamping
-GradientCheckpointing
-FlashAttention
-TritonKernel
-CUDAKernel
-KernelFusion
-OperatorFusion
-KVCache
-CacheCompression
-CacheQuantization
-KVQuantization
-INT8Quantization
-FP8Quantization
-GPTQ
-AWQ
-SmoothQuant
-StaticQuantization
-DynamicQuantization
-Calibration
-Perplexity
-NeedleInHaystack
-LongContext
-ContextLength
+Mamba-2
+Mamba
+selective state space
+matrix state
+vector state
+RWKV-7
+RWKV
+token shift
+LoRA
+low-rank adaptation
+RMSNorm
+L2 normalization
+cosine attention
+causal masking
+block-causal mask
+autoregressive decoding
+streaming inference
+conv lookback
+short convolution
+initial state
+final state
+tensor parallel
+TP parallel
+PTQ
+post-training quantization
+KV quantization
+FLOPs roofline
+roofline analysis
 TTFT
-DecodeLatency
-Throughput
-RooflineModel
-MemoryBandwidth
-ComputeBound
-MemoryBound
-ArithmeticIntensity
-Occupancy
-TensorCore
-WarpSpecialization
-AsyncCopy
-TMA
-ClusterLaunch
-PersistentKernel
-MultiStagePipeline
-DoubleBuffering
-OverlapComputeMemory
-WorkloadBalance
-LoadBalancing
-Parallelism
-TensorParallel
-PipelineParallel
-SequenceParallel
-ContextParallel
-ExpertParallel
-MoE
-MixtureOfExperts
-DistributedTraining
-ZeRO
-FSDP
-ActivationCheckpointing
-GradientAccumulation
-MixedPrecisionTraining
-LossScaling
-GradientClipping
-LearningRateSchedule
-Warmup
-CosineDecay
-WeightDecay
-LabelSmoothing
-DataAugmentation
-CurriculumLearning
-ProgressiveResizing
-TokenDropout
-LayerDrop
-StochasticDepth
-ModelPruning
+time to first token
+latency budget
+memory budget
+bandwidth bound
+compute bound
+kernel fusion
+fused kernels
+flash-linear-attention
+FLA
+mamba-ssm
+einops
+einsum
+triangular solve
+unitriangular
