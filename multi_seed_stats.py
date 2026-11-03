@@ -3781,6 +3781,19 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                        'for this one.'),
         'test_resolution': resolution,
         # -------------------------------------------------------------------------
+        # Equivalence verdict.  Always present so a consumer never has to
+        # guess whether the key is missing because no verdict was reached or
+        # because the record predates the field: ``None`` means "no verdict"
+        # (no pre-specified margin, or a degenerate sample), ``True``/``False``
+        # is the TOST outcome for a pre-specified margin.
+        # -------------------------------------------------------------------------
+        'practically_equivalent': None,
+        'equivalence_note': (
+            'No pre-specified equivalence margin was supplied, so this record '
+            'makes NO practical-equivalence claim: a non-significant '
+            'difference is not evidence that the two arms are practically the '
+            'same. See docs/equivalence-testing.md.'),
+        # -------------------------------------------------------------------------
         # NEW: data quality metrics
         # -------------------------------------------------------------------------
         'outlier_seeds': outlier_seeds,
@@ -3794,6 +3807,11 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
     }
     if tost is not None:
         record['tost'] = tost
+        record['practically_equivalent'] = tost['equivalent']
+        record['equivalence_note'] = (
+            f'Practical equivalence was decided by the pre-specified TOST '
+            f'margin {equivalence_margin!r} at alpha={alpha!r}; the verdict '
+            f'is the TOST outcome, never a non-significant superiority test.')
         record['equivalence_margin_supported'] = equivalence_margin_supported(
             d, alpha=alpha)
     if include_seed_influence:
