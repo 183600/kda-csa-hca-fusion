@@ -4008,12 +4008,13 @@ def design_manifest(plan_ids=None, *, seeds_by_plan=None, provenance=None) -> di
         'method': ('normal approximation for planning only; inference '
                    'uses multi_seed_stats exact sign/permutation and '
                    't tests'),
+        'schema_version': '1.1',
         'plan_fingerprint_scope': PLAN_FINGERPRINT_SCOPE,
     }
     if provenance is not None:
         metadata['provenance'] = provenance
     return {
-        'schema_version': '1.0',
+        'schema_version': '1.1',
         'kind': 'experiment_design',
         'created_utc': _dt.datetime.now(_dt.timezone.utc).isoformat(),
         'metadata': metadata,

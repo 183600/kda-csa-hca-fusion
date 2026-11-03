@@ -3656,13 +3656,65 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                             n_permutations=n_permutations,
                             max_exact=max_exact)
     boot = bootstrap_paired_ci(d, alpha=alpha, n_boot=n_boot, seed=seed)
-    dz = cohens_dz(d)
+    dz = cohens_dz(d) if n >= 2 else None
     dz_ci = cohens_dz_ci(d, alpha=alpha, n_boot=n_boot, seed=seed)
     n_pos = sum(1 for x in d if x > 0)
     n_neg = sum(1 for x in d if x < 0)
     n_nonzero = n_pos + n_neg
     win_rate = (n_pos / n_nonzero) if n_nonzero else None
+    # ---------------------------------------------------------------------------
+    # Outlier detection: seeds whose difference is more than 3 MAD from the
+    # median.  MAD = median(|d - median(d)|).  A robust flag so a single
+    # diverged seed does not silently shift the mean without comment.
+    # ---------------------------------------------------------------------------
+    mad = None
+    outlier_seeds: list[int] = []
+    med = None  # define here so it's always available for the note below
+    if n >= 2:
+        med = _safe_median(d)
+        if med is not None:
+            deviations = [abs(x - med) for x in d]
+            mad = _safe_median(deviations)
+            if mad is not None and mad > 0:
+                # Modified z-score: 0.6745 * (x - median) / MAD
+                # Threshold 3.5 is a common rule-of-thumb for outlier detection.
+                for i, x in enumerate(d):
+                    z = 0.6745 * (x - med) / mad
+                    if abs(z) > 3.5:
+                        outlier_seeds.append(i)
+# ---------------------------------------------------------------------------
+    # Effect-size categorization (Cohen's dz guidance, two-sided):
+    #     |dz| < 0.2   : trivial
+    #     0.2 <= |dz| < 0.5  : small
+    #     0.5 <= |dz| < 0.8  : medium
+    #     |dz| >= 0.8  : large
+    #     dz is None   : undefined (e.g. n < 2 or degenerate data)
+    # ---------------------------------------------------------------------------
+    dz = cohens_dz(d) if n >= 2 else None
+    if dz is None:
+        effect_size_category = 'undefined'
+    elif abs(dz) < 0.2:
+        effect_size_category = 'trivial'
+    elif abs(dz) < 0.5:
+        effect_size_category = 'small'
+    elif abs(dz) < 0.8:
+        effect_size_category = 'medium'
+    else:
+        effect_size_category = 'large'
+    # ---------------------------------------------------------------------------
+    # Seed contribution: how many seeds had finite, non-error per-seed
+    # values that entered the mean.  n_seeds_contributed is the count of
+    # seeds that qualified (no error, finite final_acc + final_loss).
+    # ---------------------------------------------------------------------------
+    n_seeds_contributed = 0
+    if isinstance(d, list) and n > 0:
+        # d is already _as_clean_diffs output; each entry corresponds to one
+        # seed's per-seed difference.  Count how many were finite and kept.
+        n_seeds_contributed = sum(
+            1 for x in d if x is not None and math.isfinite(float(x)))
+    # ---------------------------------------------------------------------------
     # t-based CI for the mean difference (companion to the bootstrap CI).
+    # ---------------------------------------------------------------------------
     ci_lo = ci_hi = None
     if n >= 2 and sd is not None and sd > 0.0:
         # Two-sided t critical value via bisection on the log survival
@@ -3728,13 +3780,17 @@ def summarize_paired(diffs, seed: int = 0, n_boot: int = 10000,
                        '|d_z| (two-sided alpha, 80% power), not a guarantee '
                        'for this one.'),
         'test_resolution': resolution,
-        'practically_equivalent': (tost['equivalent'] if tost else None),
-        'equivalence_note': (
-            'practically_equivalent is None unless a PRE-SPECIFIED '
-            'equivalence_margin was supplied: a non-significant superiority '
-            'test is not evidence of equivalence. When a TOST is present, '
-            'it tests |mean_diff| < margin and can positively support a '
-            '"practically the same" claim.'),
+        # -------------------------------------------------------------------------
+        # NEW: data quality metrics
+        # -------------------------------------------------------------------------
+        'outlier_seeds': outlier_seeds,
+        'n_outlier_seeds': len(outlier_seeds),
+        'effect_size_category': effect_size_category,
+        'n_seeds_contributed': n_seeds_contributed,
+        'outlier_note': (
+            f'{len(outlier_seeds)} seed{"s" if len(outlier_seeds) != 1 else ""} '
+            f'flagged as outliers (|modified z-score| > 3.5, MAD-based) '
+            f'from the median {("n/a" if med is None else str(med))}'),
     }
     if tost is not None:
         record['tost'] = tost

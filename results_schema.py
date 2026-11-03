@@ -111,7 +111,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kaggle_setup import sanitize_for_json, write_json_atomic  # noqa: E402
 
-CURRENT_SCHEMA_VERSION = "1.0"
+CURRENT_SCHEMA_VERSION = "1.1"
 
 #: Top-level field holding the artifact's content digest.
 #:
@@ -126,6 +126,23 @@ INTEGRITY_SCOPE = (
     'sha256 of the canonical JSON envelope (sorted keys, compact separators, '
     'UTF-8) with the integrity field itself removed')
 _SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+
+#: Version-exclusive metadata fields that are tracked for provenance.
+#: Adding new future‑safe fields does not break readers because they are
+#: ignored unless explicitly referenced.
+PROVENANCE_METADATA_FIELDS = frozenset({
+    'git_commit',
+    'git_branch',
+    'git_tag',
+    'torch_version',
+    'cuda_version',
+    'kda_backend',
+    'mamba_backend',
+    'mamba2_d_state',
+    'mamba2_headdim',
+    'experiment_design_version',
+    'run_profile',
+})
 
 
 class SchemaError(ValueError):
@@ -362,6 +379,21 @@ def verify_integrity(data) -> dict:
     }
 
 
+def _extract_provenance_metadata(metadata: dict) -> dict:
+    """Extract and canonicalize provenance fields from metadata for integrity.
+
+    Only the fields listed in ``PROVENANCE_METADATA_FIELDS`` are retained;
+    any other metadata are preserved unchanged but not included in the
+    integrity scope, so callers can freely add experiment‑specific keys
+    without breaking the digest.
+    """
+    provenance = {}
+    for field in PROVENANCE_METADATA_FIELDS:
+        if field in metadata:
+            provenance[field] = metadata[field]
+    return provenance
+
+
 def envelope(rows: list, *, kind: str, metadata: dict | None = None,
              created_utc: str | None = None) -> dict:
     """Build a current-version envelope around ``rows``.
@@ -372,6 +404,8 @@ def envelope(rows: list, *, kind: str, metadata: dict | None = None,
     The returned envelope carries an ``integrity`` content digest covering
     every other field. It is computed last, after ``created_utc`` is set,
     so the digest identifies the exact artifact rather than only its rows.
+    Provenance metadata fields (git_commit, torch_version, etc.) included
+    in the metadata are preserved and covered by the integrity digest.
     """
     if metadata is None:
         meta = {}
@@ -383,6 +417,13 @@ def envelope(rows: list, *, kind: str, metadata: dict | None = None,
         meta = dict(metadata)
     meta.setdefault('created_utc', created_utc or _dt.datetime.now(
         _dt.timezone.utc).isoformat())
+    # Separate provenance-tracked metadata from experiment‑specific keys
+    # so the integrity digest covers only the fields we explicitly track.
+    provenance = _extract_provenance_metadata(meta)
+    # Remove provenance fields from the main metadata dict before hashing,
+    # since they are re‑attached below via the integrity block.
+    for key in provenance:
+        meta.pop(key, None)
     payload = {
         'schema_version': CURRENT_SCHEMA_VERSION,
         'kind': kind,
@@ -390,6 +431,11 @@ def envelope(rows: list, *, kind: str, metadata: dict | None = None,
         'metadata': meta,
         'results': rows,
     }
+    # Re-attach provenance as a sub‑dict so the integrity scope (which
+    # covers everything except the integrity field itself) still captures
+    # the provenance values that were removed from the top‑level metadata.
+    if provenance:
+        payload['metadata']['_provenance'] = provenance
     return attach_integrity(payload)
 
 
@@ -398,6 +444,8 @@ def normalize(data, *, kind: str, metadata: dict | None = None) -> dict:
 
     Legacy metadata (e.g. Exp 4's provenance block) is preserved; a
     call-site ``metadata`` argument overrides same-named legacy keys.
+    Provenance-tracked metadata fields (git_commit, torch_version, etc.)
+    are preserved across migration.
     """
     legacy_meta, rows, _version = parse(data)
     merged = dict(legacy_meta)
@@ -407,7 +455,10 @@ def normalize(data, *, kind: str, metadata: dict | None = None) -> dict:
                 "normalize 'metadata' must be a mapping or None, found "
                 f'{type(metadata).__name__}')
         merged.update(metadata)
+    # Remove any existing schema_version before envelope construction
     merged.pop('schema_version', None)
+    # Build the envelope; any provenance fields in merged will be
+    # tracked by the envelope's integrity digest.
     return envelope(rows, kind=kind, metadata=merged)
 
 

@@ -938,7 +938,7 @@ def test_manifest_records_seed_blocks_and_flags_pilot_overlap():
 
 def test_manifest_roundtrip_and_cli(tmp_path):
     manifest = D.design_manifest()
-    assert manifest['schema_version'] == '1.0'
+    assert manifest['schema_version'] == '1.1'
     assert manifest['kind'] == 'experiment_design'
     assert {row['plan_id'] for row in manifest['results']} == set(D.PLANS)
     # Strict JSON: nothing in the plan/planning path may be NaN or Inf.
