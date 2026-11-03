@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import ops_csa  # noqa: E402
+import results_schema  # noqa: E402
 import run_mechanism_ablation as M  # noqa: E402
 from ops_fused import CSAHybridLayer, HybridKCHAttention  # noqa: E402
 from run_quality import make_kv_update_batch, make_mqar_batch  # noqa: E402
@@ -632,8 +633,10 @@ def test_exp8_smoke_envelope():
                 payload = json.load(f)
             _ok('envelope kind + schema version',
                 payload.get('kind') == 'exp8_mechanism_ablation'
-                and payload.get('schema_version') == '1.0',
-                f"kind={payload.get('kind')}")
+                and payload.get('schema_version')
+                == results_schema.CURRENT_SCHEMA_VERSION,
+                f"kind={payload.get('kind')}, "
+                f"schema_version={payload.get('schema_version')}")
             rows = payload.get('results', [])
             _ok('one row per variant', len(rows) == 2,
                 f'n_rows={len(rows)}')

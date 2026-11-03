@@ -72,7 +72,7 @@ on-disk shape    example                                         version
 ===============  ==============================================  =======
 bare array       ``results/exp2_benchmark.json``                 ``0.0``
 legacy envelope  ``results/exp4_mqar.json``                      ``1``
-versioned env.   files written by this module                    ``1.0``
+versioned env.   files written by this module                    ``1.1``
 ===============  ==============================================  =======
 
 * Legacy ``0.0`` files are migrated in-memory by :func:`parse` /
