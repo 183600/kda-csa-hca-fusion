@@ -2030,3 +2030,14 @@ def compiled_chunk_kda(
         scale, g_clamp_min,
         initial_state,
     )
+
+
+__all__ = [
+    "per_channel_log_decay_bias",
+    "naive_recurrent_kda",
+    "compiled_recurrent_kda",
+    "naive_chunk_kda",
+    "scripted_chunk_kda",
+    "assoc_scan_chunk_kda",
+    "compiled_chunk_kda",
+]
