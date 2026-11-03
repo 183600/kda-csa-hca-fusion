@@ -184,6 +184,7 @@ py-modules = [
     "train_lm_autodl",
     "train_toy_reference",
     "ttft_budget",
+    "backup_results",
 ]
 packages = [
     "checks",
