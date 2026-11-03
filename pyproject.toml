@@ -151,6 +151,7 @@ py-modules = [
     "ppl_calibration",
     "precision_sweep",
     "prefill_profile",
+    "ptq_calibrate",
     "recall_efficiency",
     "recall_flops_audit",
     "recall_reach",
