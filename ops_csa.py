@@ -46,7 +46,11 @@ def _bf16_safe_softmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     if logits.dtype == torch.bfloat16:
         # Clamp to prevent exp overflow (exp(50) ~ 5e21, well below bf16 max ~3e38)
         # but large enough to not affect normal probability distributions.
-        logits = logits.clamp(min=-50.0, max=50.0)
+        # ``-inf`` marks masked-out slots and must survive the clamp:
+        # clamping it to -50 would leak ~e-50 probability mass into
+        # masked slots (and defeat the all-masked-row NaN guard).
+        logits = torch.where(
+            torch.isneginf(logits), logits, logits.clamp(min=-50.0, max=50.0))
     return torch.softmax(logits, dim=dim)
 
 
@@ -320,14 +324,14 @@ def _sliding_window_attention(
         # too — but on the small ``ct + win - 1`` slice, not on the full
         # ``T + win - 1`` tensor.
         C_slice = C_padded[:, t_lo : t_hi + win - 1]       # [B, ct+win-1, c]
-        # When ct < win, the slice length (ct+win-1) is less than win,
-        # and ``unfold(size=win, step=1)`` returns an empty tensor
-        # (dimension 1 becomes 0).  Guard against that by padding the
-        # slice on the left so its length is at least win.  The extra
-        # positions are all zeros (from the original F.pad) and are
-        # masked out by ``valid_mask``, so they contribute nothing to
-        # the softmax output — the numerical result is identical to the
-        # unfold-on-full-T path for the same query positions.
+        # For ct >= 1 the slice always yields exactly ``ct`` windows from
+        # ``unfold(size=win, step=1)`` ((ct+win-1) - win + 1 = ct), so the
+        # left-pad below is mathematically REDUNDANT — it is kept as a
+        # defensive normalization for the short-chunk regime (it pads the
+        # slice to at least ``win`` positions and the leading all-zero
+        # windows are discarded immediately after, which is bit-identical
+        # to the unpadded path because the kept windows have identical
+        # content and the zero rows are -inf-masked in the softmax).
         if ct < win:
             C_slice = F.pad(C_slice, (0, 0, win - ct, 0))   # [B, win+win-1, c]
         C_windows = C_slice.unfold(1, win, 1).permute(0, 1, 3, 2)  # [B, max(ct,win), win, c]
@@ -2793,13 +2797,37 @@ def naive_csa(
                     # Only scatter valid positions
                     if valid_flat.any():
                         pos_mask[batch_idx[valid_flat], query_idx[valid_flat], idx_flat[valid_flat]] = True
+                    # NaN safety: ``logits`` is -inf at causally invalid
+                    # blocks. Multiplying those entries by a 0/1 mask
+                    # produces NaN (-inf * 0), which poisons the scalar
+                    # loss through the mean and — via the finite check
+                    # below — silently disabled the whole auxiliary
+                    # signal. Restrict BOTH branches to finite
+                    # (causally valid) entries: pos = selected blocks,
+                    # neg = valid-but-not-selected blocks. Rows with no
+                    # valid candidates (t < m) reduce to the constant
+                    # softplus(0) = log(2) and contribute no gradient,
+                    # which is the correct InfoNCE semantics for "no
+                    # candidates yet".
+                    finite = torch.isfinite(logits)
                     # Positive logits: mean over selected blocks per query
                     pos_count = pos_mask.float().sum(-1).clamp(min=1)
-                    pos_logits = (logits * pos_mask.float()).sum(-1) / pos_count  # [B, T]
-                    # Negative logits: mean over non-selected blocks per query
-                    neg_mask = ~pos_mask
+                    pos_logits = (torch.where(
+                        pos_mask, logits,
+                        torch.zeros((), device=logits.device,
+                                    dtype=logits.dtype)).sum(-1) / pos_count)  # [B, T]
+                    # Negative logits: mean over VALID non-selected blocks
+                    # per query. Including the causally invalid -inf
+                    # entries here would make neg_logits -inf for almost
+                    # every row, so the clamp below saturated the whole
+                    # loss at softplus(-20) ~= 2e-9 — a negligible (and
+                    # nearly constant) training signal.
+                    neg_mask = finite & ~pos_mask
                     neg_count = neg_mask.float().sum(-1).clamp(min=1)
-                    neg_logits = (logits * neg_mask.float()).sum(-1) / neg_count  # [B, T]
+                    neg_logits = (torch.where(
+                        neg_mask, logits,
+                        torch.zeros((), device=logits.device,
+                                    dtype=logits.dtype)).sum(-1) / neg_count)  # [B, T]
                     # InfoNCE loss with temperature
                     temperature = ste_aux_contrastive_temp
                     logits_diff = (pos_logits - neg_logits) / temperature
@@ -2810,8 +2838,14 @@ def naive_csa(
                     # Check for NaN
                     if not torch.isfinite(contrastive_loss):
                         contrastive_loss = torch.tensor(0.0, device=kv.device, dtype=kv.dtype)
-                    # Zero-in-forward addend: backward flows contrastive_loss gradient
-                    aux_contrast = (contrastive_loss * 0).to(kv)
+                    # Zero-in-forward addend: backward flows contrastive_loss gradient.
+                    # The STE identity must be ``L - L.detach()`` (forward 0,
+                    # backward dL = 1): the previous ``L * 0`` form also had a
+                    # zero forward value but its gradient coefficient d(L*0)/dL
+                    # is exactly 0, so the contrastive gradient NEVER reached
+                    # the indexer parameters and the whole mode was silently
+                    # identical to ``topk_columns``.
+                    aux_contrast = (contrastive_loss - contrastive_loss.detach()).to(kv)
                     # Expand to match kv shape for STE identity
                     aux_contrast = aux_contrast.view(1, 1, 1, 1).expand_as(kv)
                     soft_kv = soft_kv + (aux_contrast - aux_contrast.detach())

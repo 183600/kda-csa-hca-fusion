@@ -207,13 +207,28 @@ def _bonferroni_crit_q(n, alpha=0.05):
         else:
             value = float(_T_PP(1 - alpha, n - 1))
         if math.isfinite(value):
-            return value
-    # scipy unavailable, or its tail underflowed to +/-inf even though the
-    # true quantile is finite: compute the Student-t quantile directly via
-    # the regularized incomplete beta function and bisection. The numerical
-    # integration below is dependency-free and accurate for the small seed
-    # counts used by Exp4/Exp5. The shared helper also keeps the
-    # subnormal-alpha and t**2-overflow regimes exact.
+            # A finite value is NOT proof of a correct value: scipy's
+            # generic ``rv_continuous.isf`` silently saturates at the
+            # bracket cap ``b = 1e100`` for subnormal-ish tails (e.g.
+            # ``t.isf(1e-200, 1)`` returns exactly 1e100 while the true
+            # Cauchy quantile is ~3.18e199 — 100 orders of magnitude off).
+            # Verify the returned value against the dependency-free
+            # log-survival (exact in every regime, including t**2
+            # overflow); on any disagreement fall through to the exact
+            # bisection below.
+            from multi_seed_stats import _log_student_t_sf_positive
+            target_log_sf = math.log(alpha)
+            got_log_sf = _log_student_t_sf_positive(value, n - 1)
+            if abs(got_log_sf - target_log_sf) <= 1e-6 * max(
+                    1.0, abs(target_log_sf)):
+                return value
+    # scipy unavailable, or its tail is untrustworthy (+/-inf underflow or
+    # a finite-but-saturated value such as the 1e100 cap): compute the
+    # Student-t quantile directly via the regularized incomplete beta
+    # function and bisection. The numerical integration below is
+    # dependency-free and accurate for the small seed counts used by
+    # Exp4/Exp5. The shared helper also keeps the subnormal-alpha and
+    # t**2-overflow regimes exact.
     dof = n - 1
 
     from multi_seed_stats import _log_student_t_sf_positive

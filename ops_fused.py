@@ -1687,8 +1687,11 @@ class HybridAttentionStack(nn.Module):
             :meth:`forward_functional` for DDP / ``torch.compile`` /
             BPTT use. The warning is throttled to once per process per
             class so it does not spam the training log. To silence the
-            warning explicitly, set ``HybridKCHAttention._stateful_warned = True``
+            warning explicitly, set ``HybridAttentionStack._stateful_warned = True``
             after the first forward (or use :meth:`forward_functional`).
+            Note the flag lives on the base class ``HybridAttentionStack``:
+            setting it on a subclass such as ``HybridKCHAttention`` only
+            creates a shadow attribute and does NOT silence the warning.
         """
         if self.training and not HybridAttentionStack._stateful_warned:
             import warnings as _warnings

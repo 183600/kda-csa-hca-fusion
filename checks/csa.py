@@ -1733,6 +1733,17 @@ def test_csa_indexer_ste_aux_contrastive(device='cpu'):
     # on the initialization, but it should at least be non-zero.
     # We use a small margin to allow for fp64 rounding noise.
     ac_dense_signal = ac_norm >= tk_norm - 1e-12
+    # REGRESSION GUARD: the contrastive auxiliary loss must actually inject
+    # a DISTINCT gradient into the indexer parameters. The original
+    # implementation injected it via ``contrastive_loss * 0``, whose
+    # gradient coefficient d(L*0)/dL is exactly 0 — the mode was silently
+    # bit-identical to ``topk_columns`` in backward while every assertion
+    # above kept passing (non-zero norm satisfied by the shared top-k STE
+    # path, and equality satisfied the >= comparison vacuously). With the
+    # correct ``L - L.detach()`` injection the indexer grads MUST differ.
+    ac_grad_distinct = any(
+        (grads_ac[name] - grads_tk[name]).abs().max().item() > 0.0
+        for name in indexer_param_names)
 
     # --- Part 3: no-STE invariance ---
     # ste_mode has no effect when use_ste=False. Both modes produce
@@ -1769,6 +1780,9 @@ def test_csa_indexer_ste_aux_contrastive(device='cpu'):
         _ok('aux_contrastive grad norm >= topk_columns (allowing fp64 noise)',
             ac_dense_signal,
             f'topk_columns={tk_norm:.6e}, aux_contrastive={ac_norm:.6e}'),
+        _ok('aux_contrastive injects a DISTINCT indexer gradient (not bit-equal to topk_columns)',
+            ac_grad_distinct,
+            f'max|grad_ac - grad_tk| over indexer params > 0'),
         _ok('no-STE: ste_mode has no effect (forward bit-identical)',
             noste_equiv,
             f'diff={(o_noste_tk - o_noste_ac).abs().max().item() if not noste_equiv else 0}'),
