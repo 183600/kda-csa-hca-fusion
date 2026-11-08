@@ -227,15 +227,44 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
         # gradient correctness even when the forward's correction activated.
         delta = v[:, t] - (k_t.unsqueeze(-1) * D).sum(-2)
         bk = (beta_t.unsqueeze(-1) * k_t).unsqueeze(-1)
+        # Fix for bf16 STE gradient correctness: the forward's
+        # ``_bf16_safe_addcmul`` clamps ``bk * delta`` to [-1e4, 1e4]
+        # before adding to D.  The backward must:
+        #   1. Use the SAME clamped update for ``S_t`` so the recomputed
+        #      state is bit-identical to the forward.
+        #   2. Zero the gradient through clamped elements (STE correction):
+        #      ``d(clamp(x))/dx = 0`` when ``|x| > max_val``, so the
+        #      adjoint must not propagate ``dS`` into ``delta``/``bk``
+        #      for elements whose forward update was saturated.
+        # For non-bf16 dtypes, ``_bf16_safe_addcmul`` is equivalent to
+        # ``torch.addcmul`` (no clamp), so the original code path is
+        # preserved for bit-exact fp32/fp64 parity with the reference.
         S_t = _bf16_safe_addcmul(D, bk, delta.unsqueeze(-2))
+        # Detect clamp activation for bf16 STE correction: compute the
+        # raw (unclamped) update and compare with the clamped version.
+        # Only needed for bf16 where the clamp can activate.
+        not_clamped = None
+        if D.dtype == torch.bfloat16:
+            raw_update = bk * delta.unsqueeze(-2)
+            clamped_update = raw_update.clamp(min=-1e4, max=1e4)
+            not_clamped = (raw_update == clamped_update)
 
         torch.mul(q[:, t].unsqueeze(-1), grad_o[:, t].unsqueeze(-2),
                   out=scratch)
         dS = dS.add_(scratch)
         dq[:, t] = (grad_o[:, t].unsqueeze(-2)
                     @ S_t.transpose(-1, -2)).squeeze(-2)
-        ddelta = (dS * bk).sum(-2)
-        dbk = (dS * delta.unsqueeze(-2)).sum(-1)
+        # STE correction: zero dS for clamped elements so the gradient
+        # flows only through elements whose forward update was unclamped.
+        # For non-bf16 dtypes, not_clamped is None and the correction
+        # is skipped (the clamp never activates, preserving bit-exact
+        # parity with the reference autograd path).
+        if not_clamped is not None:
+            dS_effective = dS * not_clamped.to(dS.dtype)
+        else:
+            dS_effective = dS
+        ddelta = (dS_effective * bk).sum(-2)
+        dbk = (dS_effective * delta.unsqueeze(-2)).sum(-1)
         dbeta[:, t] = (dbk * k_t).sum(-1)
         dk_t = dbk * beta_t.unsqueeze(-1)
         dv[:, t] = ddelta
