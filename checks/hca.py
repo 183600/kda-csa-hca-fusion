@@ -1571,6 +1571,8 @@ def test_csa_hca_rope_module_matches_naive(device='cpu'):
     layer = CSAHybridLayer(cfg).to(device).eval()
     with torch.no_grad():
         y_mod, _ = layer(x)
+        _sw_kv_w = (layer.W_KV_local.weight
+                     if layer.W_KV_local is not None else None)
         y_ref = layer.o_proj(_naive_csa(
             x, layer.W_aKV.weight, layer.W_bKV.weight,
             layer.W_aZ.weight, layer.W_bZ.weight, layer.Ba, layer.Bb,
@@ -1583,6 +1585,7 @@ def test_csa_hca_rope_module_matches_naive(device='cpu'):
             use_ste=layer.use_ste, normalize_qk=True,
             rope_dim=cfg.csa_rope_dim, rope_base=cfg.rope_base,
             qk_norm_mode=cfg.csa_qk_norm_mode,
+            W_KV_local=_sw_kv_w,
         ))
     results.append(_ok(
         'csa_hybrid_layer_rope_matches_naive',
@@ -1594,6 +1597,8 @@ def test_csa_hca_rope_module_matches_naive(device='cpu'):
     layer = HCAHybridLayer(cfg).to(device).eval()
     with torch.no_grad():
         y_mod, _ = layer(x)
+        _hca_sw_kv_w = (layer.W_KV_local.weight
+                         if layer.W_KV_local is not None else None)
         y_ref = layer.o_proj(_naive_hca(
             x, layer.W_KV.weight, layer.W_Z.weight, layer.B_pos,
             layer.W_DQ.weight, layer.W_UQ.weight,
@@ -1601,6 +1606,8 @@ def test_csa_hca_rope_module_matches_naive(device='cpu'):
             sliding_window=cfg.hca_sliding_window, sink_logits=layer.sink,
             rope_dim=cfg.hca_rope_dim, rope_base=cfg.rope_base,
             qk_norm_mode=cfg.hca_qk_norm_mode,
+            normalize_qk=getattr(cfg, 'hca_normalize_qk', True),
+            W_KV_local=_hca_sw_kv_w,
         ))
     results.append(_ok(
         'hca_hybrid_layer_rope_matches_naive',

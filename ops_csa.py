@@ -2121,6 +2121,7 @@ def naive_csa(
     indexer_chunk: int = 0,
     compress_chunk: int = 0,
     recompute_indexer: bool = False,
+    W_KV_local: torch.Tensor | None = None,   # [c, d] optional separate SW projection
 ):
     """Full CSA forward (compression + indexer + sparse MQA core attention).
 
@@ -2897,14 +2898,26 @@ def naive_csa(
     # local KV) so they can share the compressed entries' softmax below.
     if sliding_window > 0:
         win = sliding_window
-        H_proj = Ca_c  # [B, T, c], already == F.linear(H, W_aKV)
+        # When W_KV_local is provided (paper-faithful mode), compute the SW
+        # keys/values with a dedicated projection (DeepSeek-V4 §2.3.1).
+        # Otherwise fall back to Ca_c (the a-branch projection), which is
+        # parameter-efficient but reuses the compressed-branch features.
+        if W_KV_local is not None:
+            H_proj = F.linear(H, W_KV_local).to(compute_dtype)  # [B, T, c]
+        else:
+            H_proj = Ca_c  # [B, T, c], already == F.linear(H, W_aKV)
         if normalize_qk:
             # Exact same elementwise chain either way; the in-place form is
             # used only when this call exclusively owns the storage (the
-            # cast produced a fresh copy) or the projection is not returned
-            # (nothing else reads ``Ca`` afterwards).
-            if (not torch.is_grad_enabled()) and (
-                    H_proj is not Ca or not return_projections):
+            # cast produced a fresh copy or a separate projection was used)
+            # AND autograd is not recording (in-place ops break backward).
+            # When W_KV_local is provided, H_proj is a fresh F.linear output
+            # that is safe to modify — but only outside autograd.
+            _owns_sw = (W_KV_local is not None and
+                        not torch.is_grad_enabled()) or (
+                (not torch.is_grad_enabled()) and (
+                    H_proj is not Ca or not return_projections))
+            if _owns_sw:
                 C_local = _qk_normalize_(H_proj, qk_norm_mode)     # [B, T, c]
             else:
                 C_local = _qk_normalize(H_proj, qk_norm_mode)      # [B, T, c]

@@ -74,6 +74,7 @@ def naive_hca(
     rope_base: float = 10000.0,
     qk_norm_mode: str = 'l2',
     compress_chunk: int = 0,
+    normalize_qk: bool = True,
 ):
     """Full HCA forward (heavy compression + dense MQA + optional SW + sink).
 
@@ -202,17 +203,22 @@ def naive_hca(
     # ``partial_rope``) with no other readers left, so with autograd
     # disabled the normalization runs in place (identical elementwise
     # chain, one fewer block-sized temporary).
-    C_comp_n = (_qk_normalize(C_comp, qk_norm_mode)
-                if torch.is_grad_enabled()
-                else _qk_normalize_(C_comp, qk_norm_mode))
+    if normalize_qk:
+        C_comp_n = (_qk_normalize(C_comp, qk_norm_mode)
+                    if torch.is_grad_enabled()
+                    else _qk_normalize_(C_comp, qk_norm_mode))
+    else:
+        C_comp_n = C_comp.to(compute_dtype if H.dtype != torch.float64
+                             else torch.float64)
 
     # --- 2. Dense shared-KV MQA ---
     compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     cQ = F.linear(H, W_DQ)                                         # [B, T, dc]
     q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
     # Same reasoning as above: ``q`` is this call's private tensor.
-    q = (_qk_normalize(q, qk_norm_mode) if torch.is_grad_enabled()
-         else _qk_normalize_(q, qk_norm_mode))
+    if normalize_qk:
+        q = (_qk_normalize(q, qk_norm_mode) if torch.is_grad_enabled()
+             else _qk_normalize_(q, qk_norm_mode))
     # Partial RoPE on the core-attention queries (§2.3.3): rotate each
     # query at its own token position AFTER normalization (the decoding
     # cache applies the same order: the caller normalizes ``q``, the cache
@@ -223,10 +229,16 @@ def naive_hca(
         q = partial_rope(q, tpos, rope_dim_eff, rope_base, dim=1)
     # Core-attention scale auto-selection: ``scale=None`` (the default)
     # resolves to 1.0 for the cosine 'l2' mode and to the standard 1/sqrt(c)
-    # temperature for the paper-form 'rms' mode. An explicit ``scale=`` is
-    # always honoured.
+    # temperature for the paper-form 'rms' mode. When normalize_qk is False,
+    # vectors are NOT normalized so we use 1/sqrt(c) regardless of mode.
+    # An explicit ``scale=`` is always honoured.
     if scale is None:
-        scale = c ** -0.5 if qk_norm_mode == 'rms' else 1.0
+        if not normalize_qk:
+            scale = c ** -0.5
+        elif qk_norm_mode == 'rms':
+            scale = c ** -0.5
+        else:
+            scale = 1.0
 
     # Query-axis tiling for the dense score / joint-softmax / value
     # pipeline. Every operation below is row-wise along the query axis, so
@@ -261,13 +273,17 @@ def naive_hca(
         else:
             C_local_raw = C
         C_local_src = C_local_raw.to(compute_dtype)
-        # In-place only when the cast produced a fresh copy or ``C`` is not
-        # returned (otherwise the projection storage would be mutated).
-        if (not torch.is_grad_enabled()) and (
-                C_local_src is not C or not return_projections):
-            C_local = _qk_normalize_(C_local_src, qk_norm_mode)     # [B, T, c]
+        if normalize_qk:
+            # In-place only when the cast produced a fresh copy or ``C``
+            # is not returned (otherwise the projection storage would be
+            # mutated).
+            if (not torch.is_grad_enabled()) and (
+                    C_local_src is not C or not return_projections):
+                C_local = _qk_normalize_(C_local_src, qk_norm_mode)     # [B, T, c]
+            else:
+                C_local = _qk_normalize(C_local_src, qk_norm_mode)      # [B, T, c]
         else:
-            C_local = _qk_normalize(C_local_src, qk_norm_mode)      # [B, T, c]
+            C_local = C_local_src
         # Partial RoPE on the sliding-window keys (§2.3.3): each key
         # rotates at its own token position; the decoding cache's ring
         # buffer applies the same normalize-then-rotate order at append

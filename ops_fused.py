@@ -241,6 +241,32 @@ class HybridConfig:
     csa_ste_mode: str = 'topk_columns'
     # Temperature for aux_contrastive loss (InfoNCE)
     csa_aux_contrastive_temp: float = 1.0
+    # Normalize queries and KV entries before core attention (CSA).
+    # True (default) applies L2 normalization for cosine attention;
+    # False uses raw dot-product attention with 1/sqrt(c) scaling.
+    # The CSAHybridLayer previously hardcoded this to True; exposing it
+    # as a config field enables ablation studies.
+    csa_normalize_qk: bool = True
+    # Normalize queries and KV entries before core attention (HCA).
+    # True (default) applies L2 normalization for cosine attention.
+    # The naive_hca function previously always normalized without an
+    # option to disable; this field enables ablation consistency with CSA.
+    hca_normalize_qk: bool = True
+    # Separate sliding-window KV projection for CSA.
+    # When True, CSAHybridLayer creates a dedicated W_KV_local
+    # projection for the sliding-window branch keys/values, matching the
+    # DeepSeek-V4 paper (§2.3.1) where the SW branch has its own projection.
+    # When False (default), the SW branch reuses the a-branch projection
+    # (Ca), which is parameter-efficient and compatible with existing
+    # decoding caches. Enable for paper-faithful experiments.
+    csa_separate_sw_proj: bool = False
+    # Separate sliding-window KV projection for HCA.
+    # When True, HCAHybridLayer creates a dedicated W_KV_local
+    # projection for the sliding-window branch, matching the DeepSeek-V4
+    # paper (§2.3.2). When False (default), the SW branch reuses the
+    # compressed branch projection (C). Enable for paper-faithful
+    # experiments.
+    hca_separate_sw_proj: bool = False
     # HCA config
     hca_m2: int = 64            # heavy compression (>> csa_m)
     hca_nh: int = 4
@@ -427,6 +453,13 @@ class HybridConfig:
         if not math.isfinite(temp) or temp <= 0:
             raise ValueError(
                 f"HybridConfig.csa_aux_contrastive_temp={self.csa_aux_contrastive_temp} must be positive and finite.")
+        # Validate the new boolean config fields (strict bool check).
+        for _fname in ('csa_normalize_qk', 'hca_normalize_qk',
+                       'csa_separate_sw_proj', 'hca_separate_sw_proj'):
+            _fval = getattr(self, _fname)
+            if not isinstance(_fval, bool):
+                raise TypeError(
+                    f"HybridConfig.{_fname}={_fval!r} must be a bool.")
         # KDA backend selection is deliberately validated at config creation,
         # while the optional FLA import remains lazy until a forward pass. This
         # keeps the default reference experiments dependency-free and makes a
@@ -1278,6 +1311,16 @@ class CSAHybridLayer(nn.Module):
         self.B_idx = nn.Parameter(torch.randn(cfg.csa_m, cfg.csa_cI) * cfg.init_std)
         self.sink = nn.Parameter(torch.zeros(cfg.csa_nh))
         self.o_proj = nn.Linear(c * cfg.csa_nh, d, bias=False)
+        # Separate sliding-window KV projection (DeepSeek-V4 §2.3.1).
+        # The paper specifies that the sliding-window branch uses its own
+        # KV projection, distinct from the compressed-branch projections.
+        # When cfg.csa_separate_sw_proj is True (default), we create a
+        # dedicated W_KV_local; otherwise the SW branch reuses Ca (the
+        # a-branch projection) for parameter efficiency.
+        if getattr(cfg, 'csa_separate_sw_proj', False):
+            self.W_KV_local = nn.Linear(d, c, bias=False)
+        else:
+            self.W_KV_local = None
         self.indexer_is_trained = True
         # Controls whether ``forward`` passes ``use_ste=True`` to
         # ``naive_csa``. Exposed as an instance attribute (not a config
@@ -1321,6 +1364,12 @@ class CSAHybridLayer(nn.Module):
         # Only warn when STE is explicitly disabled (ablation mode).
         if self.training and not self.use_ste:
             self._maybe_warn_indexer()
+        # Build the sliding-window KV weight argument: the dedicated
+        # W_KV_local projection when it exists (paper-faithful), or None
+        # to fall back to the a-branch projection (Ca) for parameter
+        # efficiency.
+        _sw_kv_weight = (self.W_KV_local.weight
+                         if self.W_KV_local is not None else None)
         o = naive_csa(
             x, self.W_aKV.weight, self.W_bKV.weight,
             self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
@@ -1338,14 +1387,16 @@ class CSAHybridLayer(nn.Module):
             use_ste=self.use_ste,
             ste_mode=cfg.csa_ste_mode,
             ste_aux_contrastive_temp=cfg.csa_aux_contrastive_temp,
-            # Match the cosine-style CSA indexer contract: rankings should be
-            # driven by direction, not by arbitrary q_idx / K_idx magnitudes.
-            normalize_qk=True,
+            # Use the configurable normalize_qk (was previously hardcoded
+            # to True). Default True matches the cosine-style CSA contract.
+            normalize_qk=getattr(cfg, 'csa_normalize_qk', True),
             # Bounded-memory indexer scoring (0 = full-sequence scoring).
             indexer_chunk=cfg.csa_indexer_chunk,
             # Memory-efficient STE backward (training only): retain the
             # selected top-k weights, recompute the full softmax per tile.
             recompute_indexer=cfg.csa_recompute_indexer,
+            # Pass the separate SW projection weight (None = reuse Ca).
+            W_KV_local=_sw_kv_weight,
         )
         return self.o_proj(o), None
 
@@ -1364,9 +1415,23 @@ class HCAHybridLayer(nn.Module):
         self.W_UQ = nn.Linear(cfg.hca_dc, c * cfg.hca_nh, bias=False)
         self.sink = nn.Parameter(torch.zeros(cfg.hca_nh))
         self.o_proj = nn.Linear(c * cfg.hca_nh, d, bias=False)
+        # Separate sliding-window KV projection (DeepSeek-V4 §2.3.2).
+        # The paper specifies that the SW branch has its own projection,
+        # distinct from the compressed-branch C. When cfg.hca_separate_sw_proj
+        # is True (default), we create a dedicated W_KV_local; otherwise
+        # the SW branch reuses C for parameter efficiency.
+        if getattr(cfg, 'hca_separate_sw_proj', False):
+            self.W_KV_local = nn.Linear(d, c, bias=False)
+        else:
+            self.W_KV_local = None
 
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
         cfg = self.cfg
+        # Build the sliding-window KV weight argument: the dedicated
+        # W_KV_local projection when it exists (paper-faithful), or None
+        # to fall back to the compressed-branch projection (C).
+        _sw_kv_weight = (self.W_KV_local.weight
+                         if self.W_KV_local is not None else None)
         o = naive_hca(
             x, self.W_KV.weight, self.W_Z.weight, self.B_pos,
             self.W_DQ.weight, self.W_UQ.weight,
@@ -1377,6 +1442,11 @@ class HCAHybridLayer(nn.Module):
             rope_dim=cfg.hca_rope_dim,
             rope_base=cfg.rope_base,
             qk_norm_mode=cfg.hca_qk_norm_mode,
+            # Pass the configurable normalize_qk (was previously always
+            # True inside naive_hca without an option to disable).
+            normalize_qk=getattr(cfg, 'hca_normalize_qk', True),
+            # Pass the separate SW projection weight (None = reuse C).
+            W_KV_local=_sw_kv_weight,
         )
         return self.o_proj(o), None
 
