@@ -199,6 +199,8 @@ def naive_hca(
         C_comp = partial_rope(
             C_comp, block_positions(n_blocks, m2, device),
             rope_dim_eff, rope_base, dim=1)
+    # --- 2. Dense shared-KV MQA ---
+    compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
     # ``C_comp`` is a fresh compression output (optionally re-bound by
     # ``partial_rope``) with no other readers left, so with autograd
     # disabled the normalization runs in place (identical elementwise
@@ -208,11 +210,7 @@ def naive_hca(
                     if torch.is_grad_enabled()
                     else _qk_normalize_(C_comp, qk_norm_mode))
     else:
-        C_comp_n = C_comp.to(compute_dtype if H.dtype != torch.float64
-                             else torch.float64)
-
-    # --- 2. Dense shared-KV MQA ---
-    compute_dtype = torch.float64 if H.dtype == torch.float64 else torch.float
+        C_comp_n = C_comp.to(compute_dtype)
     cQ = F.linear(H, W_DQ)                                         # [B, T, dc]
     q = F.linear(cQ, W_UQ).view(B_, T, nh, c).to(compute_dtype)    # [B, T, nh, c]
     # Same reasoning as above: ``q`` is this call's private tensor.
