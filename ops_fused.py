@@ -214,6 +214,15 @@ class HybridConfig:
     csa_nIh: int = 2
     csa_cI: int = 32
     csa_sliding_window: int = 16
+    # Compressed-block tile size for the CSA/HCA KV compression kernels
+    # (0 = automatic heuristic from ``_resolve_compress_tile``; a positive
+    # value caps the number of compressed blocks processed per tile).
+    # The compression is value-equivalent up to the softmax-kernel reduction
+    # ULP; only the transient logits buffer footprint changes. Exposed as
+    # a config field so ablation runners can tune it without touching the
+    # layer code.
+    csa_compress_chunk: int = 0
+    hca_compress_chunk: int = 0
     # Query-axis tile size for the CSA lightning indexer (0 = disabled,
     # the historical full-sequence scoring). A positive value caps the
     # peak per-head indexer score tensor at
@@ -645,6 +654,18 @@ class HybridConfig:
                 f"csa_indexer_chunk={self.csa_indexer_chunk!r} must be a "
                 f"non-negative int (0 disables query-axis tiling of the "
                 f"CSA lightning indexer).")
+        # ``csa_compress_chunk`` / ``hca_compress_chunk`` tile the
+        # compressed-block axis of the KV compression kernels. 0 is valid
+        # (automatic heuristic); negative values would silently run the
+        # untiled path.
+        for _cname in ('csa_compress_chunk', 'hca_compress_chunk'):
+            _cval = getattr(self, _cname)
+            if (isinstance(_cval, bool) or not isinstance(_cval, int)
+                    or _cval < 0):
+                raise ValueError(
+                    f"{_cname}={_cval!r} must be a non-negative int "
+                    f"(0 selects the automatic compression-tiling "
+                    f"heuristic).")
         # ``csa_recompute_indexer`` is a strict bool: the alternative
         # backward graph must be selected explicitly, never by a truthy
         # int. It only affects the training STE path.
@@ -1397,6 +1418,8 @@ class CSAHybridLayer(nn.Module):
             recompute_indexer=cfg.csa_recompute_indexer,
             # Pass the separate SW projection weight (None = reuse Ca).
             W_KV_local=_sw_kv_weight,
+            # Compression block tiling (0 = auto heuristic).
+            compress_chunk=getattr(cfg, 'csa_compress_chunk', 0),
         )
         return self.o_proj(o), None
 
@@ -1447,6 +1470,8 @@ class HCAHybridLayer(nn.Module):
             normalize_qk=getattr(cfg, 'hca_normalize_qk', True),
             # Pass the separate SW projection weight (None = reuse C).
             W_KV_local=_sw_kv_weight,
+            # Compression block tiling (0 = auto heuristic).
+            compress_chunk=getattr(cfg, 'hca_compress_chunk', 0),
         )
         return self.o_proj(o), None
 
