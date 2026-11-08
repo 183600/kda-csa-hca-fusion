@@ -1679,6 +1679,10 @@ class HybridAttentionStack(nn.Module):
         # called at the start of every training run / eval sequence, so
         # the warning re-fires for each new "session" of use.
         HybridAttentionStack._stateful_warned = False
+        # Also reset the CSA/HCA streaming-decode warning so a new
+        # session re-emits it if the caller again attempts token-by-token
+        # decode through the stateful forward.
+        HybridAttentionStack._csa_hca_decode_warned = False
 
     def _build_layout(self) -> list[str]:
         # Explicit layout mode: cfg.layout was validated and the 'memory'
@@ -1789,6 +1793,34 @@ class HybridAttentionStack(nn.Module):
         # change), so behavior is unchanged in every other case. With grad
         # enabled the fresh stack is kept (in-place copies do not build a
         # graph).
+        # Warn about CSA/HCA streaming-decode limitation: when the stack
+        # contains CSA or HCA layers and the caller feeds T=1 chunks
+        # (token-by-token autoregressive decode), the output will NOT
+        # match a full-sequence forward because CSA/HCA layers do not
+        # maintain decoding caches across calls in this code path.
+        if (not HybridAttentionStack._csa_hca_decode_warned
+                and not self.training
+                and x.shape[1] == 1):
+            has_csa_hca = any(
+                kind in ('csa', 'hca') for kind in self.layout)
+            if has_csa_hca:
+                import warnings as _warnings
+                _warnings.warn(
+                    "HybridAttentionStack.forward() does NOT maintain "
+                    "decoding caches for CSA/HCA layers. Token-by-token "
+                    "autoregressive decoding through this stateful "
+                    "forward produces outputs that differ from a "
+                    "full-sequence forward (CSA/HCA layers process each "
+                    "chunk independently without access to previously "
+                    "computed compressed blocks). For correct streaming "
+                    "decode, use the decoding-cache wrappers in "
+                    "run_decoding.py (CSAAttnDecoding / HCAAttnDecoding "
+                    "/ HybridAttnDecodingAdapter) which maintain "
+                    "CSADecodingCache / HCADecodingCache instances. "
+                    "This warning fires once per process per class.",
+                    stacklevel=2,
+                )
+                HybridAttentionStack._csa_hca_decode_warned = True
         state_out = None if torch.is_grad_enabled() else self._kda_state
         o, new_kda_state, new_conv_lookbacks = self._forward_functional_impl(
             x, self._kda_state,
@@ -1807,6 +1839,19 @@ class HybridAttentionStack(nn.Module):
     # of a new training run by ``reset_state()`` if the caller wants the
     # warning to fire again (e.g. after rotating log files).
     _stateful_warned = False
+
+    # Class-level one-shot warning flag for the CSA/HCA streaming-decode
+    # limitation: the stateful ``forward()`` carries recurrent state ONLY
+    # for memory layers (KDA / Mamba-2 / RWKV-7). CSA and HCA layers are
+    # STATELESS within each ``forward()`` call — they call ``naive_csa`` /
+    # ``naive_hca`` on the current input chunk without any decoding cache,
+    # so token-by-token autoregressive decoding through ``forward()``
+    # produces outputs that are NOT equivalent to a full-sequence forward.
+    # For correct streaming decode, use the decoding-cache wrappers in
+    # ``run_decoding.py`` (``CSAAttnDecoding`` / ``HCAAttnDecoding`` /
+    # ``HybridAttnDecodingAdapter``) which maintain
+    # ``CSADecodingCache`` / ``HCADecodingCache`` instances.
+    _csa_hca_decode_warned = False
 
     def forward_functional(
         self,
@@ -1832,6 +1877,27 @@ class HybridAttentionStack(nn.Module):
         want the stateful behavior use :meth:`forward`; callers who
         need the pure path use this method directly and manage the state
         externally.
+
+        .. warning:: **CSA/HCA streaming-decode limitation.**
+
+            Both ``forward()`` and ``forward_functional()`` carry recurrent
+            state ONLY for memory layers (KDA / Mamba-2 / RWKV-7). CSA and
+            HCA layers are **stateless** within each call — they invoke
+            ``naive_csa`` / ``naive_hca`` on the current input chunk without
+            any decoding cache. Token-by-token autoregressive decoding
+            through either forward path therefore produces outputs that
+            **differ from a full-sequence forward** for any stack containing
+            CSA or HCA layers: each chunk's CSA/HCA computation sees only
+            the current chunk's tokens, not the accumulated compressed
+            blocks from previous steps.
+
+            For **correct** streaming decode with CSA/HCA, use the
+            decoding-cache wrappers in ``run_decoding.py``
+            (``CSAAttnDecoding`` / ``HCAAttnDecoding`` /
+            ``HybridAttnDecodingAdapter``) which maintain
+            ``CSADecodingCache`` / ``HCADecodingCache`` instances that
+            accumulate compressed blocks across steps and produce
+            bit-identical outputs to the full-sequence forward.
 
         Args:
             x: ``[B, T, d]`` input hidden states.
