@@ -1150,7 +1150,8 @@ def _chunk_kda_prepare(
     )
     if torch.is_grad_enabled():
         # Autograd keeps the out-of-place form (the two broadcasts are saved
-        # graph nodes).
+        # as separate graph nodes for correct backward through the
+        # elementwise add-then-multiply chain).
         A = (A + eye) * beta[..., None, :]
     else:
         # Same elementwise add-then-multiply per entry; in place it needs no
