@@ -83,15 +83,26 @@ __all__ = ['custom_recurrent_kda']
 # bfloat16 numerical stability helpers
 # ---------------------------------------------------------------------------
 def _bf16_safe_exp(g: torch.Tensor, clamp_min: float = -10.0, clamp_max: float = 50.0) -> torch.Tensor:
-    """Safe exp for bfloat16: clamp log-input before exp, clamp result after.
+    """Safe exp for bfloat16: clamp log-input before exp to prevent overflow.
 
     bfloat16 has reduced exponent range (8 bits) vs fp32, so large positive
-    log-gates can overflow to Inf, and large negative ones underflow to 0.
-    Double-sided clamp prevents both.
+    log-gates can overflow to Inf. Clamping the input to ``[clamp_min,
+    clamp_max]`` before ``exp`` prevents this.
+
+    NOTE: the output is NOT clamped. An earlier version clamped the output
+    to ``[1e-5, 1e5]``, which prevented decay factors (``exp(g)`` with
+    ``g < 0``) from going below ``1e-5`` per step. With the KDA
+    ``g_clamp_min = -10``, the minimum meaningful decay is
+    ``exp(-10) ≈ 4.5e-5``, which was already at the clamp boundary.
+    For ``g_clamp_min < -10`` (or when the cumsum makes ``g`` more
+    negative), the output clamp silently erased the extra forgetting,
+    corrupting long-sequence gradients. The input clamp alone is
+    sufficient: ``exp(50) ≈ 5.2e21`` is well within bf16's
+    representable range (~3.4e38), and ``exp(-50) ≈ 1.9e-22``
+    underflows to 0, which is the correct mathematical limit.
     """
     if g.dtype == torch.bfloat16:
         g = g.clamp(min=clamp_min, max=clamp_max)
-        return g.exp().clamp(min=1e-5, max=1e5)
     return g.exp()
 
 
