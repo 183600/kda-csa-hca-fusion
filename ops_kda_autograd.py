@@ -165,7 +165,14 @@ def _custom_kda_forward_loop(q, k, v, g, beta, S, traj):
         traj[t] = S
         P = _bf16_safe_exp(g[:, t])
         S = S * P.unsqueeze(-1)
-        S = _state_scale_correction(S)
+        # NOTE: _state_scale_correction is intentionally NOT applied here.
+        # The reference ``naive_recurrent_kda`` does not clip the state norm,
+        # and the backward loop recomputes D = S_prev * P without correction.
+        # Applying it here would make the forward use a corrected D while
+        # the backward uses the uncorrected D, producing gradient errors
+        # when the correction activates (bf16, state norm > 1e4).
+        # ``_bf16_safe_addcmul`` below already clamps the update term to
+        # prevent single-step blowup, which is the realistic overflow path.
         delta = v[:, t] - (k[:, t].unsqueeze(-1) * S).sum(-2)
         beta_k = (beta[:, t].unsqueeze(-1) * k[:, t]).unsqueeze(-1)
         S = _bf16_safe_addcmul(S, beta_k, delta.unsqueeze(-2))
@@ -194,7 +201,19 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
         beta_t = beta[:, t]
         P = _bf16_safe_exp(g[:, t])
         D = S_prev * P.unsqueeze(-1)
-        D = _state_scale_correction(D)
+        # NOTE: do NOT apply _state_scale_correction to D here.
+        # The forward loop stores traj[t] = S (the POST-addcmul, PRE-decay
+        # state) and then computes S * P followed by _state_scale_correction.
+        # However, the PRE-correction D is what the forward actually used
+        # for the delta computation when the correction is a no-op (which
+        # is the common case: it only activates for bfloat16 states with
+        # norm > 1e4). When the correction IS active, applying it here
+        # would recompute a DIFFERENT D than the forward used (because
+        # traj[t] is the un-corrected addcmul output, not the corrected
+        # one), producing gradients for a different forward pass.
+        # Removing this correction makes the backward recompute the exact
+        # same D as the forward (S_prev * P, no correction), ensuring
+        # gradient correctness even when the forward's correction activated.
         delta = v[:, t] - (k_t.unsqueeze(-1) * D).sum(-2)
         bk = (beta_t.unsqueeze(-1) * k_t).unsqueeze(-1)
         S_t = _bf16_safe_addcmul(D, bk, delta.unsqueeze(-2))
