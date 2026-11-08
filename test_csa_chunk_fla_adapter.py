@@ -405,7 +405,7 @@ def test_kda_fla_backend_adapter_contract(device='cpu'):
 
         # Output/state dtype normalization.
         def half_kernel(q, k, v, g, beta, scale=None, initial_state=None,
-                        output_final_state=False):
+                        output_final_state=False, **kwargs):
             out = _delegate(q, k, v, g, beta, scale, initial_state, True)[0]
             state = torch.zeros(1, 2, 4, 4, dtype=torch.float16,
                                 device=v.device)
@@ -420,7 +420,8 @@ def test_kda_fla_backend_adapter_contract(device='cpu'):
             f'o={o_h.dtype}, s={s_h.dtype}')
 
         def half_kernel_fp64(q, k, v, g, beta, scale=None,
-                             initial_state=None, output_final_state=False):
+                             initial_state=None, output_final_state=False,
+                             **kwargs):
             out = _delegate(q, k, v, g, beta, scale, initial_state, True)[0]
             state = torch.zeros(1, 2, 4, 4, dtype=torch.float32,
                                 device=v.device)
@@ -434,20 +435,42 @@ def test_kda_fla_backend_adapter_contract(device='cpu'):
         _ok('fp64-in: state normalized to fp64', s64.dtype == torch.float64,
             f's={s64.dtype}')
 
-        # Dropped contract flags must warn, never silently.
+        # Dropped contract flags must raise (not silently proceed).
+        # The RuntimeError ensures that backend='auto' falls back to
+        # the reference path and backend='fla' surfaces an actionable error.
+        # Users who have verified their FLA build can bypass with
+        # KDA_FLA_ACCEPT_DROPPED_FLAGS=1.
         def no_flags_kernel(q, k, v, g, beta, scale=None, initial_state=None,
                             output_final_state=False):
             return _delegate(q, k, v, g, beta, scale, initial_state,
                              output_final_state)
         _install_fake_fla(no_flags_kernel, no_flags_kernel)
+        _dropped_raised = False
         with cuda_patch, warnings.catch_warnings(record=True) as w:
             warnings.simplefilter('always')
-            kda_forward(q, k, v, g, beta, output_final_state=True,
-                        backend='fla', use_chunk=False)
-        _ok('dropped contract flags emit RuntimeWarning',
-            any(issubclass(x.category, RuntimeWarning)
-                and 'does not accept' in str(x.message) for x in w),
-            f'{len(w)} warning(s)')
+            try:
+                kda_forward(q, k, v, g, beta, output_final_state=True,
+                            backend='fla', use_chunk=False)
+            except RuntimeError as _e:
+                _dropped_raised = ('does not accept the contract flags'
+                                   in str(_e))
+        _ok('dropped contract flags raise RuntimeError (not silent)',
+            _dropped_raised,
+            f'{len(w)} warning(s), raised={_dropped_raised}')
+        # With the bypass env-var, the call must succeed with a warning.
+        import os as _os
+        _os.environ['KDA_FLA_ACCEPT_DROPPED_FLAGS'] = '1'
+        try:
+            with cuda_patch, warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter('always')
+                kda_forward(q, k, v, g, beta, output_final_state=True,
+                            backend='fla', use_chunk=False)
+            _ok('KDA_FLA_ACCEPT_DROPPED_FLAGS=1 bypasses the raise',
+                any(issubclass(x.category, RuntimeWarning)
+                    and 'does not accept' in str(x.message) for x in w),
+                f'{len(w)} warning(s)')
+        finally:
+            _os.environ.pop('KDA_FLA_ACCEPT_DROPPED_FLAGS', None)
 
         # VAR_KEYWORD signature: everything forwarded, nothing warned.
         def var_kw_kernel(q, k, v, g, beta, **kwargs):
@@ -534,7 +557,8 @@ def test_kda_fla_backend_adapter_contract(device='cpu'):
         # precision). A half-precision state must therefore be normalized
         # to fp32 on the FLA side instead of tripping the kernel's assert.
         def fp32_state_kernel(q, k, v, g, beta, scale=None,
-                              initial_state=None, output_final_state=False):
+                              initial_state=None, output_final_state=False,
+                              **kwargs):
             if initial_state is not None:
                 assert initial_state.dtype == torch.float32, (
                     'initial_state must be in float32.')

@@ -139,13 +139,36 @@ def _warn_dropped_contract_flags(fn: Any, kept: dict[str, Any],
                                  kwargs: dict[str, Any]) -> None:
     dropped = [k for k in _CONTRACT_FLAGS if k in kwargs and k not in kept]
     if dropped:
+        # Map each dropped flag to the specific double-transformation risk
+        # it creates, so the user gets an actionable diagnosis instead of a
+        # generic "may apply them a second time" message.
+        _risk = {
+            "use_qk_l2norm_in_kernel":
+                "q/k will be L2-normalised a second time inside the FLA "
+                "kernel (the caller already normalised them), shrinking "
+                "per-head dot products by ~1/H and corrupting the delta"
+                "-rule recurrence",
+            "use_gate_in_kernel":
+                "the log-decay gate g will have softplus (or another "
+                "activation) applied a second time inside the FLA kernel "
+                "(the caller already computed g = -softplus(u) * scale), "
+                "changing every channel's effective decay rate",
+            "use_beta_sigmoid_in_kernel":
+                "beta will have sigmoid applied a second time inside the "
+                "FLA kernel (the caller already applied sigmoid), squashing "
+                "the delta-rule learning rate from [0,1] to [0.5, 0.731]",
+        }
+        risks = "; ".join(_risk.get(k, k) for k in dropped)
         warnings.warn(
             f"The installed FLA KDA operator "
-            f"{getattr(fn, '__name__', fn)!r} does not accept {dropped}; "
-            f"its in-kernel default for those transformations may apply "
-            f"them a second time on top of the already pre-processed "
-            f"q/k/g/beta, changing the numerical contract versus the "
-            f"reference backend.", RuntimeWarning, stacklevel=3)
+            f"{getattr(fn, '__name__', fn)!r} does not accept {dropped}. "
+            f"The kernel's built-in default for these flags likely applies "
+            f"transformations a SECOND time on top of the already "
+            f"pre-processed inputs: {risks}. "
+            f"To fix: upgrade flash-linear-attention to a revision that "
+            f"accepts these flags, or set kda_backend='reference' to use "
+            f"the numerically-exact PyTorch reference path.",
+            RuntimeWarning, stacklevel=3)
 
 
 # ``inspect.signature`` is introspection-heavy and the accepted keyword set
@@ -261,7 +284,41 @@ def _call_fla(
     }
     if g_clamp_min > -float('inf'):
         kwargs["g_clamp_min"] = g_clamp_min
-    result = fn(**_supported_kwargs(fn, kwargs))
+    filtered_kwargs = _supported_kwargs(fn, kwargs)
+    # Safety: when the installed FLA revision does not accept the contract
+    # flags (``use_qk_l2norm_in_kernel``, ``use_gate_in_kernel``,
+    # ``use_beta_sigmoid_in_kernel``), the kernel's built-in default may
+    # apply those transformations a SECOND time on the already-processed
+    # inputs.  This produces silently incorrect results that are hard to
+    # diagnose (the output is finite but numerically wrong — e.g. double
+    # L2-normalised q/k shrink per-head dot products by ~1/H, and double
+    # sigmoid on beta squashes the delta-rule learning rate from [0,1] to
+    # [0.5, 0.731]).  Rather than silently return wrong values, raise a
+    # RuntimeError so that ``kda_forward``'s ``auto`` backend falls back to
+    # the numerically-exact reference path, and an explicit ``'fla'``
+    # request surfaces an actionable error.  Users who have verified that
+    # their FLA build's defaults match the contract (e.g. all defaults are
+    # already False) can bypass this check with the environment variable
+    # ``KDA_FLA_ACCEPT_DROPPED_FLAGS=1``.
+    import os as _os
+    dropped_flags = [k for k in _CONTRACT_FLAGS
+                     if k in kwargs and k not in filtered_kwargs]
+    if (dropped_flags
+            and not _os.environ.get('KDA_FLA_ACCEPT_DROPPED_FLAGS', '')
+            .strip().lower() in ('1', 'true', 'yes')):
+        raise RuntimeError(
+            f"The installed FLA KDA operator "
+            f"{getattr(fn, '__name__', fn)!r} does not accept the contract "
+            f"flags {dropped_flags}. Without these flags, the kernel may "
+            f"apply transformations (L2-norm / softplus / sigmoid) a second "
+            f"time on the already pre-processed q/k/g/beta, producing "
+            f"silently incorrect results. Upgrade flash-linear-attention to "
+            f"a revision that accepts these flags, set "
+            f"kda_backend='reference', or set the environment variable "
+            f"KDA_FLA_ACCEPT_DROPPED_FLAGS=1 if you have verified that your "
+            f"FLA build's defaults match the contract (all transformations "
+            f"disabled by default).")
+    result = fn(**filtered_kwargs)
     # Match the repository reference contract: outputs retain the caller's
     # value dtype, while recurrent state stays in compute precision (fp32 for
     # fp16/bf16 inputs, fp64 for fp64 inputs). Without this normalization,
