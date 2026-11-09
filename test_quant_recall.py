@@ -587,8 +587,18 @@ def test_fp8_spec_and_grid():
         dtype = getattr(torch, dtype_name, None)
         if dtype is None:
             continue
-        grid = torch.linspace(0, 60000 if fmt == 'e5m2' else 500,
-                              20001)
+        # Restrict the whole-grid parity check to the FP8 *finite* range.
+        # torch's native cast returns NaN for magnitudes above the
+        # format's largest finite value (E4M3FN has no Inf code), while
+        # ``_fp8_round_magnitude`` deliberately saturates to
+        # ``max_finite`` so a quantizer never emits non-finite values.
+        # Overflow behaviour is already covered by the explicit
+        # saturation cases above (449 -> 448, 60000 -> 57344); comparing
+        # the two paths past ``max_finite`` compared a finite saturation
+        # against a NaN and could never be equal on torch builds with
+        # native float8 casts.
+        max_finite = FP8Spec(format=fmt).max_finite
+        grid = torch.linspace(0, max_finite, 20001)
         native = grid.to(dtype).float()
         manual = _fp8_round_magnitude(grid, fmt)
         _ok(f'{fmt}: manual grid matches torch native cast',
