@@ -6,13 +6,22 @@ modified with the support of the Moonshot AI Team).
 
 KDA recurrence (per head, per step t):
 
-    S_t = (I - beta_t k_t k_t^T) Diag(alpha_t) S_{t-1} + beta_t k_t v_t^T
-    o_t = S_t^T q_t
+    D_t     = Diag(alpha_t) S_{t-1}           # decayed state
+    delta_t = v_t - k_t^T D_t                  # delta-rule residual
+    S_t     = D_t + beta_t k_t delta_t^T       # state update
+    o_t     = S_t^T q_t
+
+Equivalently (substituting D_t and delta_t):
+
+    S_t = (I - beta_t k_t k_t^T Diag(alpha_t)) S_{t-1} + beta_t k_t v_t^T
 
 where alpha_t = exp(g_t) is the per-channel fine-grained forget gate (in log
 space as ``g``) and beta_t is the delta-rule learning rate. ``Diag(alpha_t)``
 is the key novelty of KDA over Gated DeltaNet (which uses a single scalar
-forget gate per head).
+forget gate per head). Note that the decay ``Diag(alpha_t)`` is applied to
+``S_{t-1}`` BEFORE the delta correction, so the residual ``delta_t`` is
+computed from the decayed state; this matters because ``Diag(alpha_t)``
+and ``k_t k_t^T`` do not commute in general.
 """
 
 from __future__ import annotations
