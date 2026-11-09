@@ -2846,7 +2846,21 @@ def naive_csa(
                     # is exactly 0, so the contrastive gradient NEVER reached
                     # the indexer parameters and the whole mode was silently
                     # identical to ``topk_columns``.
-                    aux_contrast = (contrastive_loss - contrastive_loss.detach()).to(kv)
+                    #
+                    # Gradient normalization: the scalar contrastive loss is
+                    # expanded from (1,1,1,1) to (B,T,topk,c) before being
+                    # added to soft_kv. The backward of expand is sum, which
+                    # amplifies the gradient by B*T*topk*c. Since the loss
+                    # is already .mean() over (B,T), the effective per-query
+                    # amplification is topk*c. Dividing by topk*c before
+                    # expanding normalizes the gradient so the auxiliary
+                    # signal has order-1 scale relative to the main task
+                    # gradient, preventing training instability.
+                    topk_size = kv.shape[2]
+                    c_dim = kv.shape[3]
+                    n_expand = topk_size * c_dim
+                    aux_contrast = ((contrastive_loss - contrastive_loss.detach())
+                                    / n_expand).to(kv)
                     # Expand to match kv shape for STE identity
                     aux_contrast = aux_contrast.view(1, 1, 1, 1).expand_as(kv)
                     soft_kv = soft_kv + (aux_contrast - aux_contrast.detach())
