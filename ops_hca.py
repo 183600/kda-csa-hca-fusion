@@ -22,13 +22,9 @@ import torch
 import torch.nn.functional as F
 
 from ops_csa import (
-    _bf16_safe_exp as _bf16_safe_exp,
-    _bf16_safe_softmax as _bf16_safe_softmax,
-    _bf16_scale_if_needed as _bf16_scale_if_needed,
     _require_int_geometry,
     _require_scale,
     csa_compress_kv,
-    _causal_block_mask,
     _causal_block_mask_invalid,
     _sliding_window_chunk_windows,
     _sliding_window_output,
