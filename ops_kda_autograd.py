@@ -82,27 +82,27 @@ __all__ = ['custom_recurrent_kda']
 # ---------------------------------------------------------------------------
 # bfloat16 numerical stability helpers
 # ---------------------------------------------------------------------------
-def _bf16_safe_exp(g: torch.Tensor, clamp_min: float = -10.0, clamp_max: float = 50.0) -> torch.Tensor:
-    """Safe exp for bfloat16: clamp log-input before exp to prevent overflow.
+def _bf16_safe_exp(g: torch.Tensor, clamp_max: float = 50.0) -> torch.Tensor:
+    """Safe exp for bfloat16: clamp log-input upper bound before exp.
 
-    bfloat16 has reduced exponent range (8 bits) vs fp32, so large positive
-    log-gates can overflow to Inf. Clamping the input to ``[clamp_min,
-    clamp_max]`` before ``exp`` prevents this.
+    Only the UPPER bound needs clamping: large positive log-gates can
+    overflow bf16's 8-bit exponent to Inf. ``exp(50) ≈ 5.2e21`` is well
+    within bf16's representable range (~3.4e38), so ``clamp_max=50.0``
+    prevents overflow while preserving all meaningful decay values.
 
-    NOTE: the output is NOT clamped. An earlier version clamped the output
-    to ``[1e-5, 1e5]``, which prevented decay factors (``exp(g)`` with
-    ``g < 0``) from going below ``1e-5`` per step. With the KDA
-    ``g_clamp_min = -10``, the minimum meaningful decay is
-    ``exp(-10) ≈ 4.5e-5``, which was already at the clamp boundary.
-    For ``g_clamp_min < -10`` (or when the cumsum makes ``g`` more
-    negative), the output clamp silently erased the extra forgetting,
-    corrupting long-sequence gradients. The input clamp alone is
-    sufficient: ``exp(50) ≈ 5.2e21`` is well within bf16's
-    representable range (~3.4e38), and ``exp(-50) ≈ 1.9e-22``
-    underflows to 0, which is the correct mathematical limit.
+    The LOWER bound is NOT clamped here. The caller (``custom_recurrent_kda``)
+    already applies ``g_clamp_min`` BEFORE the autograd Function, so ``g``
+    is guaranteed to satisfy ``g >= g_clamp_min``. Applying a second lower
+    clamp inside the forward/backward loops would override the user's
+    ``g_clamp_min`` when it is more negative than the hard-coded value
+    (e.g. ``g_clamp_min=-20.0`` would be silently raised to ``-10.0``),
+    producing incorrect decay factors (``exp(-10) ≈ 4.5e-5`` instead of
+    ``exp(-20) ≈ 2e-9``) and corrupting the gradient. For very negative
+    ``g``, ``exp(g)`` underflows to 0 in bf16, which IS the correct
+    mathematical limit and does not need guarding.
     """
     if g.dtype == torch.bfloat16:
-        g = g.clamp(min=clamp_min, max=clamp_max)
+        g = g.clamp(max=clamp_max)
     return g.exp()
 
 
