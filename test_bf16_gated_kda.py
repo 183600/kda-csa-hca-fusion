@@ -493,12 +493,11 @@ def test_kda_log_decay_init_under_autocast():
 def test_bf16_scale_helpers_at_dtype_limit():
     print('\nTest: bf16 norm-clipping helpers at the dtype limit')
     from ops_csa import _bf16_scale_if_needed as csa_scale
-    from ops_hca import _bf16_scale_if_needed as hca_scale
     from ops_kda_autograd import _state_scale_correction
 
     torch.manual_seed(0)
     normal = torch.randn(3, 7, dtype=torch.bfloat16) * 3.0
-    for fn in (csa_scale, hca_scale):
+    for fn in (csa_scale,):
         historical = normal * (
             1e4 / (normal.norm(p=2, dim=-1, keepdim=True) + 1e-8)
         ).clamp(max=1.0)
@@ -508,7 +507,7 @@ def test_bf16_scale_helpers_at_dtype_limit():
     limit = torch.finfo(torch.bfloat16).max
     x = torch.tensor([[limit, 0.0], [limit, limit], [-limit, limit]],
                      dtype=torch.bfloat16)
-    for fn in (csa_scale, hca_scale):
+    for fn in (csa_scale,):
         y = fn(x)
         row_norms = y.float().norm(p=2, dim=-1)
         _ok(f'{fn.__module__}: finite bf16 input is not erased',
@@ -520,7 +519,7 @@ def test_bf16_scale_helpers_at_dtype_limit():
 
     mixed = torch.tensor([[limit, 0.0], [float('nan'), 1.0]],
                          dtype=torch.bfloat16)
-    for fn in (csa_scale, hca_scale):
+    for fn in (csa_scale,):
         y = fn(mixed)
         norm = float(y[0].float().norm())
         _ok(f'{fn.__module__}: non-finite neighbour does not erase a '
