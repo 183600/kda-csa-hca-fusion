@@ -1094,11 +1094,29 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
         contain ``+inf`` scores get all their mass on those entries
         (``1/k`` each) — the ``softmax`` limit — so the result stays finite
         instead of ``NaN``.
+
+        NaN entries in the input logits are treated as invalid (mapped to
+        ``-inf`` before softmax, yielding zero probability).  This
+        prevents NaN from upstream numerical issues (e.g. gradient
+        explosion, overflow in the indexer dot products) from silently
+        corrupting every downstream attention weight.  NaN rows that
+        become fully ``-inf`` after this replacement are then zeroed by
+        the all-masked handler, matching the existing contract.
     """
+    # NaN guard: replace NaN logits with ``-inf`` so they receive zero
+    # probability instead of propagating NaN through the softmax kernel.
+    # ``logits != logits`` is the canonical NaN predicate (True iff NaN).
+    has_nan = bool(torch.isnan(logits).any())
+    if has_nan:
+        logits = logits.masked_fill(torch.isnan(logits), float('-inf'))
     if all_masked_mask is None:
         all_masked = logits.isneginf().all(dim=dim, keepdim=True)
     else:
-        all_masked = all_masked_mask
+        # Recompute the all-masked predicate after NaN replacement so
+        # rows that became fully ``-inf`` (all entries were NaN or
+        # ``-inf``) are correctly detected and zeroed below.
+        all_masked = (all_masked_mask
+                      | logits.isneginf().all(dim=dim, keepdim=True))
     # ``+inf`` scores: torch.softmax returns NaN there, so the limit is
     # applied explicitly (all the mass on the +inf entries, 1/k each).
     pos_inf = logits.isposinf()
@@ -1132,7 +1150,18 @@ def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
     handles them. Finite and all-``-inf`` rows follow the historical
     log-space shift exactly, including the in-place fast path when the
     caller owns ``scores``.
+
+    NaN entries in the input scores are replaced with ``-inf`` (zero
+    probability) before the shifted logsumexp, mirroring
+    :func:`_nan_safe_softmax`.  This prevents NaN from upstream numerical
+    issues from corrupting the joint softmax denominator.
     """
+    # NaN guard: replace NaN scores with ``-inf`` so they receive zero
+    # probability.  ``scores != scores`` is the canonical NaN predicate.
+    has_nan = bool(torch.isnan(scores).any())
+    if has_nan:
+        scores = scores.masked_fill(torch.isnan(scores), float('-inf'))
+        inplace_ok = False  # NaN replacement produced a fresh tensor
     pos_inf = scores.isposinf()
     has_pos_inf = pos_inf.any(dim=-1, keepdim=True)
     any_pos_inf = bool(has_pos_inf.any())
@@ -1145,7 +1174,12 @@ def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
     if all_masked_mask is None:
         all_masked = torch.isneginf(row_max)
     else:
-        all_masked = all_masked_mask
+        # When NaN entries were replaced with ``-inf``, rows that were
+        # fully NaN (or NaN + ``-inf``) now appear as all-``-inf`` in the
+        # ``row_max`` reduction.  Recompute the mask from the actual data
+        # to catch these rows in addition to the caller's precomputed
+        # mask.
+        all_masked = all_masked_mask | torch.isneginf(row_max)
     row_max_safe = torch.where(
         all_masked, torch.zeros_like(row_max), row_max.clamp(min=0))
     if torch.is_grad_enabled() or not inplace_ok:
