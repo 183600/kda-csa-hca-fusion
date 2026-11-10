@@ -1695,19 +1695,19 @@ class HybridAttentionStack(nn.Module):
         # callers only have to remember a single reset call.
         for layer in self.memory_layers:
             layer.reset_conv_state()
-        # Reset the class-level warning flag so the next training run
-        # re-emits the stateful-forward warning. The flag is class-level
-        # (not instance-level) because the warning is about the API
-        # contract (stateful forward in training is dangerous regardless
-        # of which instance triggers it), but resetting it on
-        # ``reset_state()`` is the right place: ``reset_state()`` is
-        # called at the start of every training run / eval sequence, so
-        # the warning re-fires for each new "session" of use.
-        HybridAttentionStack._stateful_warned = False
-        # Also reset the CSA/HCA streaming-decode warning so a new
-        # session re-emits it if the caller again attempts token-by-token
-        # decode through the stateful forward.
-        HybridAttentionStack._csa_hca_decode_warned = False
+        # NOTE: the class-level warning flags (``_stateful_warned`` and
+        # ``_csa_hca_decode_warned``) are intentionally NOT reset here.
+        # They serve as once-per-process throttling guards for API
+        # misuse warnings (stateful forward in training / token-by-token
+        # decode with CSA/HCA). Resetting them on every ``reset_state()``
+        # call would cause the warning to fire on every training batch
+        # (``reset_state()`` is called before every micro-batch in
+        # ``train_lm_autodl.py``), flooding the log with identical
+        # messages. The flags are class-level by design — the API
+        # contract does not change between calls — so they should fire
+        # once per process and stay suppressed. Users who want to
+        # re-enable the warning for a new session can reset the flags
+        # explicitly (``HybridAttentionStack._stateful_warned = False``).
 
     def _build_layout(self) -> list[str]:
         # Explicit layout mode: cfg.layout was validated and the 'memory'
