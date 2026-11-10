@@ -303,6 +303,24 @@ def naive_hca(
             q, C_local, win, scale, device,
             return_windows=use_full_windows)
         scores_w = scores_w.permute(0, 2, 1, 3)                     # [B, nh, T, win]
+        # Fix: mask right-side padding in SW scores.
+        # ``_sliding_window_valid_mask`` only handles the left boundary
+        # (positions before 0 in the left-padded window).  When ``original_T
+        # != T`` (i.e. T was right-padded to a multiple of ``m2``), the
+        # window for queries near ``original_T - 1`` can include padding
+        # positions (>= ``original_T``) whose keys are zero.  Without
+        # masking, these zero-key positions receive score 0 (not -inf),
+        # participate in the softmax denominator, and dilute the real
+        # entries' attention weights.
+        if original_T < T:
+            window_positions = (
+                torch.arange(T, device=device)[:, None]
+                - (win - 1)
+                + torch.arange(win, device=device)[None, :])
+            right_invalid = window_positions >= original_T
+            # scores_w: [B, nh, T, win] — mask dims [1, 1, T, win]
+            scores_w.masked_fill_(
+                right_invalid[None, None], float('-inf'))
     else:
         scores_w = torch.empty(B_, nh, T, 0, dtype=compute_dtype, device=device)
         C_windows_full = None
