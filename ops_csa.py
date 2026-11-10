@@ -2898,17 +2898,26 @@ def naive_csa(
                     # identical to ``topk_columns``.
                     #
                     # Gradient normalization: the scalar contrastive loss is
-                    # expanded from (1,1,1,1) to (B,T,topk,c) before being
-                    # added to soft_kv. The backward of expand is sum, which
-                    # amplifies the gradient by B*T*topk*c. Since the loss
-                    # is already .mean() over (B,T), the effective per-query
-                    # amplification is topk*c. Dividing by topk*c before
-                    # expanding normalizes the gradient so the auxiliary
-                    # signal has order-1 scale relative to the main task
-                    # gradient, preventing training instability.
-                    topk_size = kv.shape[2]
-                    c_dim = kv.shape[3]
-                    n_expand = topk_size * c_dim
+                    # reshaped to (1,1,1,1) and then expanded to (B,T,topk,c)
+                    # before being added to soft_kv. The backward of expand
+                    # is a full reduction (sum) over ALL B*T*topk*c elements,
+                    # which amplifies the gradient by that factor. Dividing
+                    # by kv.numel() (= B*T*topk*c) before expanding exactly
+                    # cancels this amplification, so the auxiliary signal
+                    # has order-1 scale relative to the main task gradient
+                    # regardless of batch size or sequence length.
+                    #
+                    # The previous formula ``topk_size * c_dim`` under-
+                    # estimated the amplification by a factor of B*T: the
+                    # ``.mean()`` in contrastive_loss normalizes the *forward*
+                    # scalar but does NOT reduce the backward's sum-over-
+                    # elements (each of the B*T*topk*c output positions
+                    # still contributes its own gradient to the shared
+                    # scalar source). With B*T = 32*512 = 16384, the old
+                    # normalization made the auxiliary gradient ~16k times
+                    # stronger than intended, overwhelming the main task
+                    # signal and destabilizing training.
+                    n_expand = kv.numel()
                     aux_contrast = ((contrastive_loss - contrastive_loss.detach())
                                     / n_expand).to(kv)
                     # Expand to match kv shape for STE identity
