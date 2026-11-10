@@ -4015,7 +4015,27 @@ def main():
         {'params': decay, 'weight_decay': 0.1},
         {'params': no_decay, 'weight_decay': 0.0},
     ]
-    optimizer = torch.optim.AdamW(param_groups, lr=3e-4)
+    base_lr = 3e-4
+    optimizer = torch.optim.AdamW(param_groups, lr=base_lr)
+
+    # Cosine learning-rate schedule with linear warmup.
+    # Warmup stabilises the KDA delta-rule recurrence in the first steps
+    # (the per-channel gates need a few updates before the decay spectrum
+    # settles); cosine decay to ``min_lr`` avoids a hard lr cliff at the
+    # end of training, which is important for the CSA/HCA STE indexer
+    # whose gradient signal is already noisy.
+    warmup_steps = min(200, max(10, max_steps // 20))
+    min_lr = base_lr / 10.0
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(
+            max(1, max_steps - warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(min_lr / base_lr, cosine)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
     use_amp = device.type == "cuda"
     if use_amp and torch.cuda.is_bf16_supported():
@@ -4034,7 +4054,10 @@ def main():
         'model_d_model': int(model.embed.embedding_dim),
         'param_match': param_match,
         'optimizer': 'AdamW',
-        'lr': 3e-4,
+        'lr': base_lr,
+        'min_lr': min_lr,
+        'lr_scheduler': 'cosine_with_linear_warmup',
+        'warmup_steps': warmup_steps,
         'weight_decay_decay_group': 0.1,
         'weight_decay_no_decay_group': 0.0,
         'grad_clip_norm': 1.0,
@@ -4417,6 +4440,7 @@ def main():
             scaler.update()
         else:
             optimizer.step()
+        scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
         optimizer_step += 1
@@ -4425,12 +4449,14 @@ def main():
         curve_steps.append(optimizer_step)
         curve_losses.append(step_loss)
         curve_elapsed_s.append(time.time() - start)
+        current_lr = scheduler.get_last_lr()[0]
         pbar.update(1)
-        pbar.set_postfix({"loss": f"{step_loss:.4f}"})
+        pbar.set_postfix({"loss": f"{step_loss:.4f}", "lr": f"{current_lr:.2e}"})
 
         if optimizer_step % 10 == 0:
             mean_recent = sum(recent_step_losses) / len(recent_step_losses)
-            print(f"step {optimizer_step} loss {mean_recent:.4f}")
+            print(f"step {optimizer_step} loss {mean_recent:.4f} "
+                  f"lr {current_lr:.2e}")
             recent_step_losses.clear()
 
         if optimizer_step % 500 == 0:
