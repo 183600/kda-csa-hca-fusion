@@ -1106,9 +1106,11 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
     # NaN guard: replace NaN logits with ``-inf`` so they receive zero
     # probability instead of propagating NaN through the softmax kernel.
     # ``logits != logits`` is the canonical NaN predicate (True iff NaN).
-    has_nan = bool(torch.isnan(logits).any())
-    if has_nan:
-        logits = logits.masked_fill(torch.isnan(logits), float('-inf'))
+    # Use ``torch.where`` instead of a data-dependent ``bool()`` branch so
+    # the function remains traceable by ``torch.compile(fullgraph=True)``
+    # — a Python ``if bool(tensor.any())`` causes a graph break.
+    nan_mask = torch.isnan(logits)
+    logits = torch.where(nan_mask, torch.full_like(logits, float('-inf')), logits)
     if all_masked_mask is None:
         all_masked = logits.isneginf().all(dim=dim, keepdim=True)
     else:
@@ -1121,22 +1123,33 @@ def _nan_safe_softmax(logits, dim=-1, all_masked_mask=None):
     # applied explicitly (all the mass on the +inf entries, 1/k each).
     pos_inf = logits.isposinf()
     has_pos_inf = pos_inf.any(dim=dim, keepdim=True)
-    if bool(has_pos_inf.any()):
-        n_pos = pos_inf.sum(dim=dim, keepdim=True).clamp(min=1)
-        pos_soft = pos_inf.to(logits.dtype) / n_pos.to(logits.dtype)
-        # Rows without +inf keep the ordinary softmax; the +inf rows are
-        # replaced wholesale by ``pos_soft``.
-        safe_logits = logits.masked_fill(has_pos_inf, 0.0)
-        soft = _bf16_safe_softmax(safe_logits, dim=dim)
-        soft = soft.masked_fill(has_pos_inf, 0.0)
-        soft = soft.masked_fill(all_masked, 0.0)
-        return soft + pos_soft
-    if not bool(all_masked.any()):
-        # No fully-masked rows: use bf16-safe softmax.
-        return _bf16_safe_softmax(logits, dim=dim)
-    safe_logits = logits.masked_fill(all_masked, 0.0)
+    # Use ``torch.where`` to avoid data-dependent Python branches
+    # (``bool(has_pos_inf.any())`` / ``bool(all_masked.any())``) that
+    # break ``torch.compile(fullgraph=True)``. The ``where``-based path
+    # evaluates all branches and selects the result elementwise, which
+    # is graph-compatible and value-identical to the historical
+    # branching code.
+    n_pos = pos_inf.sum(dim=dim, keepdim=True).clamp(min=1)
+    pos_soft = pos_inf.to(logits.dtype) / n_pos.to(logits.dtype)
+    # Compute softmax on safe logits (+inf AND all-masked rows replaced
+    # with 0) for all rows. Replacing all-masked rows' ``-inf`` with 0
+    # BEFORE softmax prevents ``softmax([-inf, -inf, ...]) → NaN``,
+    # which would poison the backward pass's gradient even though the
+    # forward output is zeroed by ``masked_fill(all_masked, 0.0)``
+    # (the ``SoftmaxBackward`` still sees the NaN and produces NaN
+    # gradients for the ``-inf`` inputs, which propagate back to
+    # ``logits``). The ``masked_fill`` after softmax then zeros the
+    # all-masked rows' output, and the ``torch.where`` selects
+    # ``pos_soft`` for +inf rows.
+    safe_logits = logits.masked_fill(has_pos_inf | all_masked, 0.0)
     soft = _bf16_safe_softmax(safe_logits, dim=dim)
-    return soft.masked_fill(all_masked, 0.0)
+    soft = soft.masked_fill(all_masked, 0.0)
+    # Per-row selection: +inf rows → pos_soft; other rows → soft.
+    # ``has_pos_inf`` is ``[..., 1]`` (reduced over ``dim``), broadcasting
+    # to the full output shape. ``pos_soft`` is zero for non-+inf rows
+    # (pos_inf is False, so 0/n_pos = 0), and ``soft`` is the correct
+    # softmax for non-+inf rows (safe_logits == logits there).
+    return torch.where(has_pos_inf, pos_soft, soft)
 
 
 def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
@@ -1158,18 +1171,16 @@ def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
     """
     # NaN guard: replace NaN scores with ``-inf`` so they receive zero
     # probability.  ``scores != scores`` is the canonical NaN predicate.
-    has_nan = bool(torch.isnan(scores).any())
-    if has_nan:
-        scores = scores.masked_fill(torch.isnan(scores), float('-inf'))
-        inplace_ok = False  # NaN replacement produced a fresh tensor
+    # Use ``torch.where`` instead of a data-dependent ``bool()`` branch
+    # for ``torch.compile(fullgraph=True)`` compatibility.
+    nan_mask = torch.isnan(scores)
+    scores = torch.where(nan_mask, torch.full_like(scores, float('-inf')), scores)
+    inplace_ok = False  # ``torch.where`` always produces a fresh tensor
     pos_inf = scores.isposinf()
     has_pos_inf = pos_inf.any(dim=-1, keepdim=True)
-    any_pos_inf = bool(has_pos_inf.any())
-    if any_pos_inf:
-        # The +inf rows are overwritten below; a finite replacement also
-        # keeps the shared shift/logsumexp path from producing NaN.
-        scores = scores.masked_fill(has_pos_inf, 0.0)
-        inplace_ok = True
+    # The +inf rows are overwritten below; a finite replacement also
+    # keeps the shared shift/logsumexp path from producing NaN.
+    scores = scores.masked_fill(has_pos_inf, 0.0)
     row_max = scores.amax(dim=-1, keepdim=True)
     if all_masked_mask is None:
         all_masked = torch.isneginf(row_max)
@@ -1182,7 +1193,7 @@ def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
         all_masked = all_masked_mask | torch.isneginf(row_max)
     row_max_safe = torch.where(
         all_masked, torch.zeros_like(row_max), row_max.clamp(min=0))
-    if torch.is_grad_enabled() or not inplace_ok:
+    if torch.is_grad_enabled():
         shifted = scores - row_max_safe
     else:
         shifted = scores.sub_(row_max_safe)
@@ -1190,12 +1201,13 @@ def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
     # raw ``-inf - row_max`` entries still make the logsumexp backward
     # produce ``0 * inf -> NaN``; replacing them with zeros only touches
     # values that the final ``masked_fill`` discards, and keeps gradients
-    # finite for a batch containing an empty row.
-    if bool(all_masked.any()):
-        if torch.is_grad_enabled() or not inplace_ok:
-            shifted = shifted.masked_fill(all_masked, 0.0)
-        else:
-            shifted.masked_fill_(all_masked, 0.0)
+    # finite for a batch containing an empty row. Use ``masked_fill``
+    # unconditionally (``torch.where`` for ``torch.compile`` compatibility)
+    # instead of a data-dependent ``bool(all_masked.any())`` branch.
+    if torch.is_grad_enabled():
+        shifted = shifted.masked_fill(all_masked, 0.0)
+    else:
+        shifted.masked_fill_(all_masked, 0.0)
     shifted_sink = log_sink - row_max_safe
     log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
     log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
@@ -1205,11 +1217,15 @@ def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
     else:
         p = shifted.sub_(log_denom).exp_()
         p.masked_fill_(all_masked, 0.0)
-    if any_pos_inf:
-        n_pos = pos_inf.sum(dim=-1, keepdim=True).clamp(min=1)
-        pos_soft = pos_inf.to(p.dtype) / n_pos.to(p.dtype)
-        p = p.masked_fill(has_pos_inf, 0.0) + pos_soft
-        p = p.masked_fill(all_masked, 0.0)
+    # +inf rows: uniform distribution over +inf entries (softmax limit).
+    # Always compute ``pos_soft`` and apply the correction via
+    # ``torch.where`` (avoids the data-dependent ``bool()`` branch that
+    # breaks ``torch.compile(fullgraph=True)``). ``pos_soft`` is zero
+    # for non-+inf rows, so the ``where`` is a no-op there.
+    n_pos = pos_inf.sum(dim=-1, keepdim=True).clamp(min=1)
+    pos_soft = pos_inf.to(p.dtype) / n_pos.to(p.dtype)
+    p = torch.where(has_pos_inf, pos_soft, p)
+    p = p.masked_fill(all_masked, 0.0)
     return p
 
 
