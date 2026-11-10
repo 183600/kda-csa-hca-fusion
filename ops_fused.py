@@ -1335,9 +1335,9 @@ class CSAHybridLayer(nn.Module):
         # Separate sliding-window KV projection (DeepSeek-V4 §2.3.1).
         # The paper specifies that the sliding-window branch uses its own
         # KV projection, distinct from the compressed-branch projections.
-        # When cfg.csa_separate_sw_proj is True (default), we create a
-        # dedicated W_KV_local; otherwise the SW branch reuses Ca (the
-        # a-branch projection) for parameter efficiency.
+        # When cfg.csa_separate_sw_proj is True, we create a dedicated
+        # W_KV_local; otherwise (the default, False) the SW branch reuses
+        # Ca (the a-branch projection) for parameter efficiency.
         if getattr(cfg, 'csa_separate_sw_proj', False):
             self.W_KV_local = nn.Linear(d, c, bias=False)
         else:
@@ -1441,8 +1441,8 @@ class HCAHybridLayer(nn.Module):
         # Separate sliding-window KV projection (DeepSeek-V4 §2.3.2).
         # The paper specifies that the SW branch has its own projection,
         # distinct from the compressed-branch C. When cfg.hca_separate_sw_proj
-        # is True (default), we create a dedicated W_KV_local; otherwise
-        # the SW branch reuses C for parameter efficiency.
+        # is True, we create a dedicated W_KV_local; otherwise (the default,
+        # False) the SW branch reuses C for parameter efficiency.
         if getattr(cfg, 'hca_separate_sw_proj', False):
             self.W_KV_local = nn.Linear(d, c, bias=False)
         else:
