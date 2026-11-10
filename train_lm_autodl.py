@@ -4029,7 +4029,16 @@ def main():
 
     def _lr_lambda(step: int) -> float:
         if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
+            # Use (step + 1) so the FIRST optimizer step (step 0) uses
+            # lr = base_lr * 1/warmup_steps instead of 0.  LambdaLR's
+            # __init__ calls step() once, setting last_epoch=0; the first
+            # optimizer.step() then uses lr_lambda(0).  With the old
+            # "step / warmup_steps" formula lr_lambda(0) = 0 and the first
+            # step is a wasted no-op.  "+1" also removes the small
+            # discontinuity at the warmup→cosine boundary (old code jumps
+            # from (ws-1)/ws to 1.0; new code reaches 1.0 exactly at the
+            # last warmup step).
+            return float(step + 1) / float(max(1, warmup_steps))
         progress = float(step - warmup_steps) / float(
             max(1, max_steps - warmup_steps))
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
