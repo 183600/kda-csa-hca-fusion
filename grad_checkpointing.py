@@ -263,6 +263,8 @@ def _memory_layer_call(layer, x, state, lookback, detach_lookback: bool):
         _kda._PREP_ATTN_LOOP_SCRIPTED = None
         _kda._PREP_ATTN_LOOP_SCRIPTED_FAILED = True
     _prev_chunk_inner = getattr(_kda, '_CHUNK_INNER_SCRIPTED', None)
+    _prev_chunk_inner_failed = getattr(
+        _kda, '_CHUNK_INNER_SCRIPT_FAILED', None)
     if hasattr(_kda, '_CHUNK_INNER_SCRIPTED'):
         _kda._CHUNK_INNER_SCRIPTED = {}
         _kda._CHUNK_INNER_SCRIPT_FAILED = {}
@@ -279,6 +281,8 @@ def _memory_layer_call(layer, x, state, lookback, detach_lookback: bool):
             _kda._PREP_ATTN_LOOP_SCRIPTED_FAILED = _prev_prep_attn_failed
         if _prev_chunk_inner is not None:
             _kda._CHUNK_INNER_SCRIPTED = _prev_chunk_inner
+        if _prev_chunk_inner_failed is not None:
+            _kda._CHUNK_INNER_SCRIPT_FAILED = _prev_chunk_inner_failed
 
 
 def _stateless_layer_call(layer, x):
