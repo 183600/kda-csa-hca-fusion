@@ -230,9 +230,55 @@ class SavedBytesProbe:
 
 
 def _memory_layer_call(layer, x, state, lookback, detach_lookback: bool):
-    """Functional memory-layer call (pure; safe to recompute)."""
-    return layer.forward_functional(
-        x, state, lookback, detach_lookback=detach_lookback)
+    """Functional memory-layer call (pure; safe to recompute).
+
+    Suppresses TorchScript-compiled KDA recurrent loops during the call
+    so that the forward and recompute passes save tensors in the same
+    order.  The JIT-compiled loop (``ops_kda._get_scripted_recurrent_loop``)
+    produces identical *values* but a non-deterministic saved-tensor
+    ordering that breaks ``torch.utils.checkpoint``'s recompute check.
+    The eager loop is bit-identical in value and deterministic in tensor
+    ordering, which is what the checkpoint contract requires.
+    """
+    import ops_kda as _kda
+    # Save and suppress the scripted-loop caches so the eager path runs.
+    # Both the cached compiled function AND the failed flag must be
+    # overridden: ``_get_scripted_recurrent_loop`` returns the cached
+    # compiled function even when ``_FAILED`` is True, so we must also
+    # set the cached function to None.
+    _prev_scripted = _kda._RECURRENT_LOOP_SCRIPTED
+    _prev_scripted_failed = _kda._RECURRENT_LOOP_SCRIPTED_FAILED
+    _prev_inplace = _kda._RECURRENT_LOOP_INPLACE_SCRIPTED
+    _prev_inplace_failed = _kda._RECURRENT_LOOP_INPLACE_SCRIPTED_FAILED
+    _kda._RECURRENT_LOOP_SCRIPTED = None
+    _kda._RECURRENT_LOOP_SCRIPTED_FAILED = True
+    _kda._RECURRENT_LOOP_INPLACE_SCRIPTED = None
+    _kda._RECURRENT_LOOP_INPLACE_SCRIPTED_FAILED = True
+    # Also suppress the chunk-path scripted inner loop and the prep
+    # attn loop (same TorchScript/checkpoint incompatibility).
+    _prev_prep_attn = getattr(_kda, '_PREP_ATTN_LOOP_SCRIPTED', None)
+    _prev_prep_attn_failed = getattr(
+        _kda, '_PREP_ATTN_LOOP_SCRIPTED_FAILED', False)
+    if hasattr(_kda, '_PREP_ATTN_LOOP_SCRIPTED'):
+        _kda._PREP_ATTN_LOOP_SCRIPTED = None
+        _kda._PREP_ATTN_LOOP_SCRIPTED_FAILED = True
+    _prev_chunk_inner = getattr(_kda, '_CHUNK_INNER_SCRIPTED', None)
+    if hasattr(_kda, '_CHUNK_INNER_SCRIPTED'):
+        _kda._CHUNK_INNER_SCRIPTED = {}
+        _kda._CHUNK_INNER_SCRIPT_FAILED = {}
+    try:
+        return layer.forward_functional(
+            x, state, lookback, detach_lookback=detach_lookback)
+    finally:
+        _kda._RECURRENT_LOOP_SCRIPTED = _prev_scripted
+        _kda._RECURRENT_LOOP_SCRIPTED_FAILED = _prev_scripted_failed
+        _kda._RECURRENT_LOOP_INPLACE_SCRIPTED = _prev_inplace
+        _kda._RECURRENT_LOOP_INPLACE_SCRIPTED_FAILED = _prev_inplace_failed
+        if hasattr(_kda, '_PREP_ATTN_LOOP_SCRIPTED'):
+            _kda._PREP_ATTN_LOOP_SCRIPTED = _prev_prep_attn
+            _kda._PREP_ATTN_LOOP_SCRIPTED_FAILED = _prev_prep_attn_failed
+        if _prev_chunk_inner is not None:
+            _kda._CHUNK_INNER_SCRIPTED = _prev_chunk_inner
 
 
 def _stateless_layer_call(layer, x):
