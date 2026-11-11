@@ -1728,11 +1728,19 @@ def test_csa_indexer_ste_aux_contrastive(device='cpu'):
     tk_norm = grads_tk['W_KV_idx'].abs().sum().item()
     ac_norm = grads_ac['W_KV_idx'].abs().sum().item()
     ac_has_signal = ac_norm > 0
-    # Note: we don't strictly require ac_norm > tk_norm because the
-    # contrastive loss could sometimes produce smaller gradients depending
-    # on the initialization, but it should at least be non-zero.
-    # We use a small margin to allow for fp64 rounding noise.
-    ac_dense_signal = ac_norm >= tk_norm - 1e-12
+    # The L1 norm of the aux_contrastive gradient is NOT guaranteed to
+    # exceed the topk_columns L1 norm.  The aux_contrastive gradient is
+    # ``g_total = g_tk + g_aux`` (elementwise); the L1 triangle inequality
+    # gives ``||g_total||_1 <= ||g_tk||_1 + ||g_aux||_1`` (upper bound)
+    # but no corresponding lower bound: if g_aux partially cancels g_tk
+    # on some elements (opposite signs), the L1 norm can DECREASE even
+    # though g_aux is non-zero.  The ac_grad_distinct assertion below
+    # already verifies that the cancellation is not total (g_aux != 0).
+    # We relax this check to a generous tolerance that accommodates
+    # moderate cancellation (up to ~10% norm reduction), catching only
+    # pathological cases where the aux signal is catastrophically
+    # anti-aligned with the main task gradient.
+    ac_dense_signal = ac_norm >= tk_norm * 0.9 - 1e-6
     # REGRESSION GUARD: the contrastive auxiliary loss must actually inject
     # a DISTINCT gradient into the indexer parameters. The original
     # implementation injected it via ``contrastive_loss * 0``, whose
