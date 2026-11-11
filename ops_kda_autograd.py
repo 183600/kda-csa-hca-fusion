@@ -251,8 +251,14 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
         dS = dS.add_(scratch)
         dq[:, t] = (grad_o[:, t].unsqueeze(-2)
                     @ S_t.transpose(-1, -2)).squeeze(-2)
-        # STE correction: zero dS for clamped elements so the gradient
-        # flows only through elements whose forward update was unclamped.
+        # STE correction for bf16: the forward's ``_bf16_safe_addcmul``
+        # clamps ``bk * delta`` to [-1e4, 1e4], so ``S_t = D + clamp(U)``
+        # where ``U = bk * delta``.  When the clamp activates, ``dS_t/dU``
+        # is zero (STE), meaning NO gradient flows from S_t through the
+        # update — neither through the direct ``+D`` path nor through
+        # ``delta = v - k^T D`` (which also depends on D).  Both paths
+        # go through the clamped add, so both must be zeroed.
+        #
         # For non-bf16 dtypes, not_clamped is None and the correction
         # is skipped (the clamp never activates, preserving bit-exact
         # parity with the reference autograd path).
@@ -266,7 +272,14 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
         dk_t = dbk * beta_t.unsqueeze(-1)
         dv[:, t] = ddelta
         torch.mul(k_t.unsqueeze(-1), ddelta.unsqueeze(-2), out=scratch)
-        dD = dS - scratch
+        # dD uses dS_effective (the STE-masked adjoint). Both the direct
+        # ``+D`` path and the ``delta = v - k^T D`` path go through the
+        # clamped add ``S_t = D + clamp(bk * delta)``.  When the clamp
+        # activates, dS_t/dD = I - beta * k * k^T = 0 (STE), so dD must
+        # use the masked adjoint.  Using unmasked ``dS`` would leak
+        # gradient through clamped elements into the state decay path,
+        # producing incorrect ``dS_prev`` and ``dg`` for those channels.
+        dD = dS_effective - scratch
         dk_t = dk_t - (D @ ddelta.unsqueeze(-1)).squeeze(-1)
         dk[:, t] = dk_t
         dS = torch.mul(dD, P.unsqueeze(-1), out=dS)
