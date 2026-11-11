@@ -2897,31 +2897,35 @@ def naive_csa(
                     # the indexer parameters and the whole mode was silently
                     # identical to ``topk_columns``.
                     #
-                    # Gradient normalization: the scalar contrastive loss is
-                    # reshaped to (1,1,1,1) and then expanded to (B,T,topk,c)
-                    # before being added to soft_kv. The backward of expand
-                    # is a full reduction (sum) over ALL B*T*topk*c elements,
-                    # which amplifies the gradient by that factor. Dividing
-                    # by kv.numel() (= B*T*topk*c) before expanding exactly
-                    # cancels this amplification, so the auxiliary signal
-                    # has order-1 scale relative to the main task gradient
-                    # regardless of batch size or sequence length.
+                    # Gradient normalization: contrastive_loss has shape
+                    # [B, T] (one scalar per query). It is reshaped to
+                    # [B, T, 1, 1] and expanded to [B, T, topk, c] before
+                    # being added to soft_kv. The backward of expand sums
+                    # over the topk and c dimensions (topk * c elements),
+                    # amplifying the per-query gradient by that factor.
+                    # Dividing by topk * c before expanding exactly cancels
+                    # this amplification, so each query's auxiliary signal
+                    # has order-1 scale relative to the main task gradient.
                     #
-                    # The previous formula ``topk_size * c_dim`` under-
-                    # estimated the amplification by a factor of B*T: the
-                    # ``.mean()`` in contrastive_loss normalizes the *forward*
-                    # scalar but does NOT reduce the backward's sum-over-
-                    # elements (each of the B*T*topk*c output positions
-                    # still contributes its own gradient to the shared
-                    # scalar source). With B*T = 32*512 = 16384, the old
-                    # normalization made the auxiliary gradient ~16k times
-                    # stronger than intended, overwhelming the main task
-                    # signal and destabilizing training.
-                    n_expand = kv.numel()
+                    # The previous code collapsed contrastive_loss to a
+                    # 0-D scalar via .mean() and divided by kv.numel()
+                    # (= B*T*topk*c), then viewed as (1,1,1,1) and
+                    # expanded. That path had TWO problems:
+                    # (1) The .mean() backward distributes 1/(B*T) to
+                    #     each query, but the expand backward summed over
+                    #     all B*T*topk*c elements, giving an effective
+                    #     per-query gradient of 1/(B*T) — too small by
+                    #     a factor of B*T.
+                    # (2) The 0-D scalar lost all per-query structure,
+                    #     so every query received the same averaged
+                    #     gradient regardless of its own selection
+                    #     quality.
+                    topk_size = kv.shape[2]
+                    c_dim = kv.shape[3]
                     aux_contrast = ((contrastive_loss - contrastive_loss.detach())
-                                    / n_expand).to(kv)
-                    # Expand to match kv shape for STE identity
-                    aux_contrast = aux_contrast.view(1, 1, 1, 1).expand_as(kv)
+                                    / (topk_size * c_dim)).to(kv)
+                    # Expand per-query [B, T, 1, 1] to [B, T, topk, c]
+                    aux_contrast = aux_contrast.unsqueeze(-1).unsqueeze(-1).expand_as(kv)
                     soft_kv = soft_kv + (aux_contrast - aux_contrast.detach())
 
             # STE: forward = kv (hard), backward = soft_kv (differentiable).
