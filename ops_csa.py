@@ -2884,42 +2884,38 @@ def naive_csa(
                     logits_diff = (pos_logits - neg_logits) / temperature
                     # Clamp for numerical stability
                     logits_diff = logits_diff.clamp(-20, 20)
-                    # Log-sigmoid: -log(σ(x)) = softplus(-x)
-                    contrastive_loss = F.softplus(-logits_diff).mean()  # scalar
-                    # Check for NaN
-                    if not torch.isfinite(contrastive_loss):
-                        contrastive_loss = torch.tensor(0.0, device=kv.device, dtype=kv.dtype)
-                    # Zero-in-forward addend: backward flows contrastive_loss gradient.
-                    # The STE identity must be ``L - L.detach()`` (forward 0,
-                    # backward dL = 1): the previous ``L * 0`` form also had a
-                    # zero forward value but its gradient coefficient d(L*0)/dL
-                    # is exactly 0, so the contrastive gradient NEVER reached
-                    # the indexer parameters and the whole mode was silently
-                    # identical to ``topk_columns``.
+                    # Log-sigmoid: -log(σ(x)) = softplus(-x).
+                    # IMPORTANT: do NOT call .mean() here — keep the loss
+                    # as a [B, T] per-query tensor.  Collapsing to a 0-D
+                    # scalar via .mean() destroys the per-query gradient
+                    # structure: the backward of .mean() distributes
+                    # 1/(B*T) uniformly to every query, so all queries
+                    # receive the same averaged gradient regardless of
+                    # their own selection quality, making the
+                    # aux_contrastive mode silently identical to
+                    # topk_columns.
+                    contrastive_loss = F.softplus(-logits_diff)  # [B, T]
+                    # NaN guard: if any entry is non-finite, zero out the
+                    # whole per-query loss (a per-query check would be
+                    # ideal but the expand below broadcasts the entire
+                    # tensor, so a single NaN would corrupt every query).
+                    if not bool(torch.isfinite(contrastive_loss).all()):
+                        contrastive_loss = torch.zeros_like(contrastive_loss)
+                    # Zero-in-forward addend: backward flows the
+                    # per-query contrastive_loss gradient.  The STE
+                    # identity ``L - L.detach()`` gives forward 0 and
+                    # backward dL = 1 per query.
                     #
                     # Gradient normalization: contrastive_loss has shape
-                    # [B, T] (one scalar per query). It is reshaped to
-                    # [B, T, 1, 1] and expanded to [B, T, topk, c] before
-                    # being added to soft_kv. The backward of expand sums
-                    # over the topk and c dimensions (topk * c elements),
-                    # amplifying the per-query gradient by that factor.
-                    # Dividing by topk * c before expanding exactly cancels
-                    # this amplification, so each query's auxiliary signal
-                    # has order-1 scale relative to the main task gradient.
-                    #
-                    # The previous code collapsed contrastive_loss to a
-                    # 0-D scalar via .mean() and divided by kv.numel()
-                    # (= B*T*topk*c), then viewed as (1,1,1,1) and
-                    # expanded. That path had TWO problems:
-                    # (1) The .mean() backward distributes 1/(B*T) to
-                    #     each query, but the expand backward summed over
-                    #     all B*T*topk*c elements, giving an effective
-                    #     per-query gradient of 1/(B*T) — too small by
-                    #     a factor of B*T.
-                    # (2) The 0-D scalar lost all per-query structure,
-                    #     so every query received the same averaged
-                    #     gradient regardless of its own selection
-                    #     quality.
+                    # [B, T] (one scalar per query).  It is reshaped to
+                    # [B, T, 1, 1] and expanded to [B, T, topk, c]
+                    # before being added to soft_kv.  The backward of
+                    # expand sums over the topk and c dimensions (topk *
+                    # c elements), amplifying the per-query gradient by
+                    # that factor.  Dividing by topk * c before expanding
+                    # exactly cancels this amplification, so each query's
+                    # auxiliary signal has order-1 scale relative to the
+                    # main task gradient.
                     topk_size = kv.shape[2]
                     c_dim = kv.shape[3]
                     aux_contrast = ((contrastive_loss - contrastive_loss.detach())
