@@ -275,16 +275,15 @@ def _gated_delta_loop_eager(q, k, v, gate_state, beta_k, S):
     return torch.stack(outs, dim=1).squeeze(-2), S
 
 
-def _gated_delta_loop_inplace_eager(q, k, v, gate_state, beta_k, S,
-                                    first_gated: bool):
+def _gated_delta_loop_inplace_eager(q, k, v, gate_state, beta_k, S):
     """No-grad loop body updating ``S`` in place.
 
-    ``first_gated=True`` means the caller has already applied the step-0
-    gate multiplication out of place (a caller-provided ``initial_state``
-    must not be mutated); the loop then applies the in-place gate at every
-    later step. With ``first_gated=False`` the in-place gate runs at every
-    step (the caller's zero-initialized state is exclusively owned, so the
-    in-place multiply keeps the state's dtype exactly as before).
+    Applies the gate (decay) at EVERY step, including step 0.  The
+    caller must ensure ``S`` is safe to mutate in place (either a
+    freshly allocated zero state or a cloned copy of a caller-provided
+    initial state).  This matches the KDA reference implementation
+    (``ops_kda.naive_recurrent_kda``), which decays the state at every
+    step including the first.
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -294,8 +293,7 @@ def _gated_delta_loop_inplace_eager(q, k, v, gate_state, beta_k, S,
     outs: list[torch.Tensor] = []
     for t, (q_t, k_t, v_t, bk_t) in enumerate(zip(
             q.unbind(1), k.unbind(1), v.unbind(1), beta_k.unbind(1))):
-        if t > 0 or not first_gated:
-            S = S.mul_(gate_state)
+        S = S.mul_(gate_state)
         delta = v_t - (k_t.unsqueeze(-1) * S).sum(dim=-2)
         S = S.addcmul_(bk_t.unsqueeze(-1), delta.unsqueeze(-2))
         outs.append((q_t.unsqueeze(-2) @ S).squeeze(-2))
@@ -559,19 +557,22 @@ class GatedDeltaRule(nn.Module):
         inplace = not torch.is_grad_enabled()
         if inplace:
             o_dtype = torch.promote_types(dtype, S.dtype)
-            first_gated = initial_state is not None
-            if first_gated:
-                # First-step multiply stays out of place (the caller's
-                # initial state must not be mutated); remaining steps run
-                # in place on the now-owned state.
-                S = S * gate_state
+            # When the caller provides an initial_state, clone it so the
+            # in-place loop does not mutate the caller's tensor.  The
+            # loop applies the gate (decay) at EVERY step including step
+            # 0, matching the KDA reference implementation
+            # (ops_kda.naive_recurrent_kda).  Previously the first step
+            # was skipped (first_gated=True), which was inconsistent with
+            # the reference and produced incorrect initial-state gradients
+            # (an extra gate_state factor in d_initial_state).
+            if initial_state is not None:
+                S = S.clone()
             loop_i = _get_scripted_gated_delta_loop_inplace()
             if loop_i is not None:
-                o, S = loop_i(q, k, v, gate_state, beta_k_all, S,
-                              first_gated)
+                o, S = loop_i(q, k, v, gate_state, beta_k_all, S)
             else:
                 o, S = _gated_delta_loop_inplace_eager(
-                    q, k, v, gate_state, beta_k_all, S, first_gated)
+                    q, k, v, gate_state, beta_k_all, S)
             if o.dtype != o_dtype:
                 o = o.to(o_dtype)
             return o, S
