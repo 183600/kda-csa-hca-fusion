@@ -41,6 +41,8 @@ data/
 # 实验运行时状态（本地自动生成，频繁变动）
 autodl_budget_state.json
 .ipynb_checkpoints/autodl_budget_state-checkpoint.json
+# runner 生成的 JSON 结果目录（README / COMPARISON.md 均声明其为 gitignored）
+results/
 
 # 临时 / 日志
 *.log
