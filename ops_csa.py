@@ -808,12 +808,14 @@ def _compress_block_clustered(
             logits_mc = logits[bi, ti]       # [m, c]
 
             # Cluster the m vectors into n_clusters groups.
-            # We cluster per-channel (c) independently for simplicity and
-            # because the softmax weights are also per-channel. This means
-            # each channel gets its own cluster assignment, which matches
-            # the per-channel compression semantics.
+            # Clustering operates on the full c-dimensional feature vectors
+            # (each of the m rows is a c-dim vector); all channels within
+            # one block share the same cluster assignment.  The softmax
+            # compression weights remain per-channel (applied after
+            # clustering), but the grouping is a single joint partition
+            # of the m source tokens.
             if cluster_method == 'kmeans':
-                # Simple k-means on the combined [m, c] features.
+                # Simple k-means on the [m, c] feature vectors.
                 # Initialize centroids by sampling from the data.
                 # Use deterministic seeding based on block index for tiling parity.
                 gen = torch.Generator(device=device)
@@ -3033,7 +3035,6 @@ def naive_csa(
         # participate in the softmax denominator, and dilute the real
         # entries' attention weights.
         if original_T < T:
-            right_pad_mask = torch.arange(T, device=device) >= original_T
             # scores_w: [B, T, nh, win]; window position ``w`` for query
             # ``t`` covers source position ``t - win + 1 + w``.
             window_positions = (
@@ -3043,7 +3044,15 @@ def naive_csa(
             right_invalid = window_positions >= original_T
             scores_w.masked_fill_(
                 right_invalid[None, :, None, :], float('-inf'))
-            win_valid = win_valid & ~right_pad_mask[:, None]
+            # Use the per-entry ``right_invalid`` mask (shape ``[T, win]``),
+            # NOT the per-row ``right_pad_mask[:, None]`` (shape ``[T, 1]``).
+            # The latter zeros ALL window entries for any query position
+            # ``t >= original_T``, but individual window entries for real
+            # queries (``t < original_T``) that point into the right-padding
+            # region also need to be invalidated.  The per-entry mask is
+            # correct: ``right_invalid[t, w]`` is True iff source position
+            # ``t - win + 1 + w >= original_T``.
+            win_valid = win_valid & ~right_invalid
     else:
         scores_w = torch.empty(B_, T, nh, 0, dtype=compute_dtype, device=device)
         win_valid = torch.empty(T, 0, dtype=torch.bool, device=device)
