@@ -16,7 +16,7 @@ corrupt analysis. This module defines the envelope as the single
 canonical on-disk shape, with an explicit semantic version:
 
     {
-      "schema_version": "1.0",
+      "schema_version": "1.1",
       "kind": "exp7_roofline",          # which experiment produced this
       "created_utc": "2026-...Z",
       "metadata": {...},                 # provenance / caveats

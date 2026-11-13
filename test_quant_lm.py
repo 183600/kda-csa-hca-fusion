@@ -18,8 +18,8 @@ Covers four layers:
 4. **Report self-consistency** — ``build_ptq_rows`` / ``build_qat_rows``
    aggregation (mean/min/max, min-over-seeds tolerance flag, recovery
    fraction), correct frontier pick, and validation of the committed
-   ``results/exp11_quant_lm.json`` when present (schema v1.0, byte
-   self-consistency, required row kinds).
+   ``results/exp11_quant_lm.json`` when present (current schema version,
+   byte self-consistency, required row kinds).
 
 The tests never write ``results/``; the committed artifact is only read.
 
@@ -51,7 +51,7 @@ from kv_quant import (  # noqa: E402
     fake_quantize_,
 )
 from ops_kda import naive_recurrent_kda  # noqa: E402
-from results_schema import load as load_schema  # noqa: E402
+from results_schema import CURRENT_SCHEMA_VERSION, load as load_schema  # noqa: E402
 from run_quant_lm import (  # noqa: E402
     QAT_SPEC,
     StepwiseKDALM,
@@ -662,7 +662,8 @@ def test_quant_lm_report_rows():
         payload = json.load(f)
     _ok('artifact schema kind', payload.get('kind') == 'exp11_quant_lm',
         f"{payload.get('kind')}")
-    _ok('artifact schema version', payload.get('schema_version') == '1.0',
+    _ok('artifact schema version',
+        payload.get('schema_version') == CURRENT_SCHEMA_VERSION,
         f"{payload.get('schema_version')}")
     _meta, committed = load_schema(artifact)
     kinds = {r['row_kind'] for r in committed}

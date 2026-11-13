@@ -4124,9 +4124,22 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
         prefix = f'{mem.upper()}-'
         return gid[len(prefix):] if gid.upper().startswith(prefix) else gid
 
+    # The tuned simple baselines are appended to ``groups`` as reference
+    # rows, but they are NOT factorial cells (see ``_matrix_design_audit``
+    # and the exp5b_matrix plan: memory in {kda, mamba2, rwkv7},
+    # layout_unit in {A, B, C, D}).  Including their ``linear``/``softmax``
+    # memory levels and ``BASELINE-*`` layout units in ``run_levels`` makes
+    # the balanced schedule's Cartesian product invent cells such as
+    # ('kda', 'BASELINE-softmax') that have no matching group, which raises
+    # KeyError at the ``spec_by_cell`` lookup below.  Restrict the schedule
+    # factors to the real matrix groups; the baselines are trained once per
+    # (seed, n_kv) as an appended reference block instead.
+    matrix_groups = [spec for spec in groups
+                     if spec[1] not in SIMPLE_BASELINE_KINDS]
     run_levels = {
-        'memory': sorted({str(spec[1]) for spec in groups}),
-        'layout_unit': sorted({_matrix_layout_unit(spec) for spec in groups}),
+        'memory': sorted({str(spec[1]) for spec in matrix_groups}),
+        'layout_unit': sorted({_matrix_layout_unit(spec)
+                               for spec in matrix_groups}),
         'n_kv': list(n_kv_list),
     }
     exp5b_seed_ids = seed_ids(n_seeds, plan_id='exp5b_matrix')
@@ -4140,15 +4153,24 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
                     for spec in groups}
     per_cell = {(spec[0], n_kv): []
                 for spec in groups for n_kv in n_kv_list}
+    # Non-factorial reference cells: one run per (baseline, n_kv, seed),
+    # appended after each rotated seed block.  Keeping them out of the
+    # schedule levels keeps the recorded execution order and schedule
+    # fingerprint identical to the pre-registered 3x4 factorial plan.
+    baseline_cells = [
+        {'memory': str(spec[1]), 'layout_unit': _matrix_layout_unit(spec),
+         'n_kv': n_kv}
+        for spec in baseline_specs for n_kv in n_kv_list]
     observed_execution = []
     for block_index, block in enumerate(schedule['blocks']):
         seed = schedule['seeds'][block_index]
+        block_cells = ([schedule['cells'][i] for i in block]
+                       + baseline_cells)
         logger.info(f'\n{"=" * 70}')
         logger.info(f'  seed block {block_index + 1}/{schedule["n_blocks"]} '
-                    f'(seed={seed}, {len(block)} cells)')
+                    f'(seed={seed}, {len(block_cells)} cells)')
         logger.info(f'{"=" * 70}')
-        for cell_index in block:
-            cell = schedule['cells'][cell_index]
+        for cell in block_cells:
             spec = spec_by_cell[(cell['memory'], cell['layout_unit'])]
             gid = spec[0]
             n_kv = cell['n_kv']
@@ -4172,9 +4194,14 @@ def _run_matrix_mode(device, n_seeds, steps, n_kv_list, *,
                           'seed': seed, 'error': str(e),
                           'final_acc': None, 'final_loss': None}
             per_cell[(gid, n_kv)].append(record)
-            observed_execution.append({
-                'memory': cell['memory'], 'layout_unit': cell['layout_unit'],
-                'n_kv': n_kv, 'seed': seed})
+            # Only the 3x4 factorial cells belong to the balanced
+            # execution-order audit; the appended baselines are reference
+            # rows, not treatment levels of the plan.
+            if spec[1] not in SIMPLE_BASELINE_KINDS:
+                observed_execution.append({
+                    'memory': cell['memory'],
+                    'layout_unit': cell['layout_unit'],
+                    'n_kv': n_kv, 'seed': seed})
 
     all_results = []
     for n_kv in n_kv_list:
