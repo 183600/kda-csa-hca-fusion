@@ -43,6 +43,10 @@ autodl_budget_state.json
 .ipynb_checkpoints/autodl_budget_state-checkpoint.json
 # runner 生成的 JSON 结果目录（README / COMPARISON.md 均声明其为 gitignored）
 results/
+# runner / 训练脚本生成的图表与检查点（README 目录说明均声明为 gitignored，
+# 否则 `git add -A` 会把每次运行的产物误提交进仓库）
+figures/
+checkpoints_lm/
 
 # 临时 / 日志
 *.log

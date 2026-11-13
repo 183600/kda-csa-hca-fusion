@@ -311,7 +311,7 @@ model = HybridAttentionStack(cfg, total_layers=10)
 The eight-group main experiment (KDA/Mamba2 × A/B/C/D at fixed depth):
 
 ```bash
-ABL_MODE=matrix ABL_TOTAL_LAYERS=10 ABL_D_MODEL=32 python run_ablation.py
+ABL_MODE=matrix ABL_MEMORY=kda,mamba2 ABL_TOTAL_LAYERS=10 ABL_D_MODEL=32 python run_ablation.py
 # Follow-up presets: ABL_MATRIX=csa_csa | position | budget
 ```
 
@@ -329,7 +329,7 @@ Environment knobs (set before launching):
 | `ABL_MODE` | `ratio` | `ratio` (historical sweep) or `matrix` (eight-group design) |
 | `ABL_MATRIX` | `main8` | matrix preset: `main8`, `csa_csa`, `position`, `budget` |
 | `ABL_TOTAL_LAYERS` | `10` | fixed depth for all matrix groups (multiple of 5) |
-| `ABL_MEMORY` | `kda,mamba2` | memory routes crossed in the matrix |
+| `ABL_MEMORY` | `kda,mamba2,rwkv7` | memory routes crossed in the matrix (12 groups by default; set `kda,mamba2` for the eight-group KDA/Mamba-2 table) |
 | `ABL_D_MODEL` | `32` | matrix model width (raise for the screening→formal stages) |
 | `BENCH_LENGTHS` | `128,256,512,1024,2048` | sequence lengths for Exp 2 |
 | `BENCH_REPEATS` | `5` | timed repeats per (T, op) in Exp 2 |
@@ -940,7 +940,7 @@ model = HybridAttentionStack(cfg, total_layers=10)
 八组主实验（固定深度下的 KDA/Mamba2 × A/B/C/D）：
 
 ```bash
-ABL_MODE=matrix ABL_TOTAL_LAYERS=10 ABL_D_MODEL=32 python run_ablation.py
+ABL_MODE=matrix ABL_MEMORY=kda,mamba2 ABL_TOTAL_LAYERS=10 ABL_D_MODEL=32 python run_ablation.py
 # 后续预设：ABL_MATRIX=csa_csa | position | budget
 ```
 
@@ -958,7 +958,7 @@ ABL_MODE=matrix ABL_TOTAL_LAYERS=10 ABL_D_MODEL=32 python run_ablation.py
 | `ABL_MODE` | `ratio` | `ratio`（历史扫描）或 `matrix`（八组设计） |
 | `ABL_MATRIX` | `main8` | 矩阵预设：`main8`、`csa_csa`、`position`、`budget` |
 | `ABL_TOTAL_LAYERS` | `10` | 所有矩阵组的固定深度（5 的倍数） |
-| `ABL_MEMORY` | `kda,mamba2` | 矩阵中交叉的记忆路由 |
+| `ABL_MEMORY` | `kda,mamba2,rwkv7` | 矩阵中交叉的记忆路由（默认 12 组；设为 `kda,mamba2` 得到 KDA/Mamba-2 八组表） |
 | `ABL_D_MODEL` | `32` | 矩阵模型宽度（从筛选到正式阶段可调大） |
 | `BENCH_LENGTHS` | `128,256,512,1024,2048` | 实验 2 的序列长度 |
 | `BENCH_REPEATS` | `5` | 实验 2 中每个 (T, op) 的计时重复次数 |
