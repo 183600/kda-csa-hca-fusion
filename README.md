@@ -322,7 +322,7 @@ Environment knobs (set before launching):
 | `MQAR_SEEDS` | `5` | seeds for Exp 4 |
 | `MQAR_STEPS` | `200` | training steps for non-softmax ops in Exp 4 |
 | `MQAR_SOFTMAX_STEPS` | same as `MQAR_STEPS` | optional explicitly labelled softmax long-training sensitivity run |
-| `MQAR_OPS` | `softmax,kda,mamba2,csa,hca` | operator list for Exp 4 (set `softmax,kda,csa,hca` to reproduce the historical 4-op table) |
+| `MQAR_OPS` | `linear,softmax,kda,mamba2,rwkv7,csa,hca` | operator list for Exp 4 (default also includes the `linear`/`softmax` simple-baseline ladder and the `rwkv7` memory route; set `softmax,kda,mamba2,csa,hca` for the 5-op table, or `softmax,kda,csa,hca` to reproduce the historical 4-op table) |
 | `MQAR_TASKS` | `mqar` | task list for Exp 4: `mqar`, `kv_update`, `long_range`, `multi_agg`, or `all` |
 | `ABL_SEEDS` | `7` | seeds for Exp 5 |
 | `ABL_STEPS` | `100` | training steps for Exp 5 |
@@ -951,7 +951,7 @@ ABL_MODE=matrix ABL_MEMORY=kda,mamba2 ABL_TOTAL_LAYERS=10 ABL_D_MODEL=32 python 
 | `MQAR_SEEDS` | `5` | 实验 4 的种子数 |
 | `MQAR_STEPS` | `200` | 实验 4 中非 softmax 算子的训练步数 |
 | `MQAR_SOFTMAX_STEPS` | 同 `MQAR_STEPS` | 可选的、显式标注的 softmax 长训练敏感性运行 |
-| `MQAR_OPS` | `softmax,kda,mamba2,csa,hca` | 实验 4 的算子列表（设为 `softmax,kda,csa,hca` 可复现历史 4 算子表格） |
+| `MQAR_OPS` | `linear,softmax,kda,mamba2,rwkv7,csa,hca` | 实验 4 的算子列表（默认还包含 `linear`/`softmax` 简单基线阶梯与 `rwkv7` 记忆路线；设为 `softmax,kda,mamba2,csa,hca` 得到 5 算子表，`softmax,kda,csa,hca` 可复现历史 4 算子表格） |
 | `MQAR_TASKS` | `mqar` | 实验 4 的任务列表：`mqar`、`kv_update`、`long_range`、`multi_agg` 或 `all` |
 | `ABL_SEEDS` | `7` | 实验 5 的种子数 |
 | `ABL_STEPS` | `100` | 实验 5 的训练步数 |
