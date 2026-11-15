@@ -409,9 +409,10 @@ boundaries**:
 
 These numbers are **not directly comparable** as "operator latency".
 `make_figures.fig_benchmark` splits them into separate subplots by
-`compute_boundary` and prints a warning in the caption. The stale
-`results/exp2_benchmark.json` committed in this repo predates the
-`compute_boundary` field; regenerate it with `python run_benchmark.py` to
+`compute_boundary` and prints a warning in the caption. Any stale
+`results/exp2_benchmark.json` generated locally predates the
+`compute_boundary` field (`results/` is gitignored, so no result file is
+committed in this repo); regenerate it with `python run_benchmark.py` to
 get the metadata, or rely on the `_OP_BOUNDARY_FALLBACK` mapping in
 `make_figures.py` for the legacy file.
 
@@ -431,10 +432,13 @@ accuracy 6.25%. Several ablations land within a few percentage points of
 chance, so the `conclusions_valid` flag and the Bonferroni-corrected
 t-test in `run_quality.py` are the authoritative signal — `mean_acc` alone
 is misleading. Treat near-chance results as a *smoke quality probe*, not a
-structural claim. The statistical tests currently reported are primarily
-**vs. the chance baseline**, not pairwise operator-vs-operator tests; do not
-claim that operator A is significantly better than operator B unless you add
-and report an explicit pairwise test.
+structural claim. In addition to the **vs. the chance baseline** t-tests,
+`run_quality.py` now reports explicit **seed-paired operator comparisons**:
+a paired test against the tuned reference baseline (Bonferroni-corrected)
+and Holm-corrected all-pairs tests with a pre-specified-margin equivalence
+(TOST) option. A vs-chance significance flag alone does not license an
+"A beats B" claim — use the reported paired tests and mind their
+multiplicity / resolution-limit warnings.
 
 ### 4. Decoding experiment scope (Exp 6)
 
@@ -1027,7 +1031,7 @@ pytest -q test_figures.py
 | `csa`, `hca`, `mamba2_layer` | `end_to_end_single_layer` | 单层端到端：输入投影 + 压缩 / conv + 索引器 / scan + 注意力 + 输出投影 |
 | `hybrid`, `hybrid_mamba2` | `end_to_end_multi_layer` | 5 层栈，含 LayerNorm、投影、注意力、状态管理；两行的 CSA/HCA 几何完全相同，因此这一对隔离了记忆算子的替换 |
 
-这些数字**不可**直接当作"算子延迟"来比较。`make_figures.fig_benchmark` 会按 `compute_boundary` 拆成不同子图，并在图注中打印警告。本仓库提交的旧 `results/exp2_benchmark.json` 早于 `compute_boundary` 字段；请用 `python run_benchmark.py` 重新生成以获得该元数据，或依赖 `make_figures.py` 中的 `_OP_BOUNDARY_FALLBACK` 映射处理旧文件。
+这些数字**不可**直接当作"算子延迟"来比较。`make_figures.fig_benchmark` 会按 `compute_boundary` 拆成不同子图，并在图注中打印警告。本地生成的旧 `results/exp2_benchmark.json` 早于 `compute_boundary` 字段（`results/` 已被 gitignore，仓库不会提交任何结果文件）；请用 `python run_benchmark.py` 重新生成以获得该元数据，或依赖 `make_figures.py` 中的 `_OP_BOUNDARY_FALLBACK` 映射处理旧文件。
 
 ### 2. softmax 基线的训练步数（实验 4）
 
@@ -1035,7 +1039,7 @@ pytest -q test_figures.py
 
 ### 3. MQAR 的统计功效（实验 4）
 
-默认 MQAR 配置（`vocab=16, seq_len=16, n_kv=1`）的随机水平准确率为 6.25%。若干消融落在随机水平上下几个百分点内，因此 `run_quality.py` 中的 `conclusions_valid` 标志和 Bonferroni 校正的 t 检验才是权威信号——只看 `mean_acc` 会有误导性。请把接近随机水平的结果当作*冒烟级质量探针*，而不是结构性结论。目前报告的统计检验主要是**相对随机基线**的，不是算子两两之间的检验；除非你补做并报告显式的两两检验，否则不要声称算子 A 显著优于算子 B。
+默认 MQAR 配置（`vocab=16, seq_len=16, n_kv=1`）的随机水平准确率为 6.25%。若干消融落在随机水平上下几个百分点内，因此 `run_quality.py` 中的 `conclusions_valid` 标志和 Bonferroni 校正的 t 检验才是权威信号——只看 `mean_acc` 会有误导性。请把接近随机水平的结果当作*冒烟级质量探针*，而不是结构性结论。除**相对随机基线**的 t 检验外，`run_quality.py` 还会报告显式的**种子配对算子比较**：相对调优参考基线的配对检验（Bonferroni 校正），以及 Holm 校正的全配对检验（含预先设定边界的 TOST 等效性检验）。仅凭相对随机基线显著不能声称算子 A 优于算子 B，应依据报告中已给出的配对检验结果，并留意其多重比较与分辨力限制警告。
 
 ### 4. 解码实验的范围（实验 6）
 
