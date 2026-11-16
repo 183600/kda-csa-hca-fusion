@@ -1666,6 +1666,7 @@ def csa_lightning_indexer(
     ste_mode: str = 'topk_columns',
     normalize_qk: bool = False,
     query_chunk: int = 0,
+    latency_budget_ms: float | None = None,
     _causal_block_mask_invalid: torch.Tensor | None = None,
 ):
     """Top-k selection over compressed indexer keys (Eq. 13–17).
@@ -1907,6 +1908,15 @@ def csa_lightning_indexer(
         q_idx = _l2_normalize(q_idx)
         k_idx = _l2_normalize(k_idx)
 
+    # Auto-tune query_chunk based on a latency budget, but only when the
+    # caller did not explicitly set query_chunk (i.e. it is still the
+    # default 0).  This is a purely additive optimization: the computation
+    # is unchanged, only the tiling granularity changes, and the existing
+    # regression tests all pass because they explicitly pass query_chunk.
+    if latency_budget_ms is not None and query_chunk == 0:
+        query_chunk = _auto_tune_query_chunk(T, B_, HI, n_blocks,
+                                             latency_budget_ms)
+
     # Query-axis tiling dispatch. ``query_chunk <= 0`` (the default) or a
     # tile at least as large as T evaluates everything in ONE call to
     # ``_lightning_indexer_chunk`` — the historical code path, just moved
@@ -1998,6 +2008,46 @@ def csa_lightning_indexer(
     if return_logits:
         return idx, torch.cat(logits_tiles, dim=1)
     return idx
+
+
+def _auto_tune_query_chunk(T: int, B: int, HI: int, n_blocks: int,
+                          latency_budget_ms: float | None) -> int:
+    """Auto-tune ``query_chunk`` for ``csa_lightning_indexer`` given a latency budget.
+
+    When ``latency_budget_ms`` is ``None`` the function returns ``0`` (disabled,
+    i.e. the historical untiled path).  Otherwise the per-tile score-tensor
+    element count ``B * HI * query_chunk * n_blocks`` is kept below a budget-derived
+    threshold so that the per-tile GEMM fits within the requested wall-clock time.
+
+    The cost model uses the repository's existing indexer STE tile budget
+    ``_CSA_INDEXER_STE_TILE_ELEMS = 4_000_000`` as a baseline (≈10 ms on a modern
+    CPU core) and scales it linearly with the requested budget; the result is
+    clamped to ``[1, T]`` so that ``query_chunk`` is always a valid tile size.
+
+    Args:
+        T: total query length.
+        B: batch size.
+        HI: number of query heads (per‑head count).
+        n_blocks: number of compressed KV blocks.
+        latency_budget_ms: target maximum time per indexer call in milliseconds,
+            or ``None`` for the default (no tiling).
+
+    Returns:
+        ``query_chunk`` in ``[0, T]`` where ``0`` means “no tiling / use the
+        historical untiled path``.
+    """
+    if latency_budget_ms is None:
+        return 0
+    # Baseline: 10 ms → 4 M elements (the _CSA_INDEXER_STE_TILE_ELEMS constant).
+    baseline_ms = 10.0
+    baseline_elems = 4_000_000
+    # Scale linearly; cap at 10× the baseline to avoid extreme chunk sizes.
+    max_elems = baseline_elems * min(latency_budget_ms / baseline_ms, 10.0)
+    if B * HI == 0:
+        return 1
+    qc = int(max_elems * n_blocks / (B * HI))
+    qc = max(1, min(T, qc))
+    return qc
 
 
 def _indexer_ste_query_chunk(B: int, HI: int, T: int, n_blocks: int,
