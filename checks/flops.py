@@ -1174,6 +1174,30 @@ def test_online_softmax_shared_kv_tiling(device='cpu'):
     return results
 
 
+def test_repository_lint_is_enforced(device='cpu'):
+    """Run the static hygiene gate from inside the pytest gate.
+
+    ``ci_gate.py`` only runs ``run_correctness.py`` + ``test_figures.py``,
+    so ``ci_lint.py`` (bare ``except:``, missing module docstrings, orphan
+    top-level modules) was previously a manual-only check.  Wiring it into
+    the correctness suite means a hygiene regression now fails the gate
+    on the very next loop instead of waiting for someone to run lint by
+    hand.  The check is intentionally read-only and independent of torch.
+    """
+    import pathlib
+
+    import ci_lint
+
+    findings = ci_lint.run(pathlib.Path(ci_lint.ROOT))
+    detail = '; '.join(
+        f'{p.relative_to(ci_lint.ROOT)}:{line} [{name}] {msg}'
+        for name, p, msg, line in findings[:5])
+    return [_ok(
+        'repository is lint-clean',
+        not findings,
+        detail or f'{len(findings)} finding(s)')]
+
+
 def test_online_softmax_streaming_no_host_sync(device='cpu'):
     """The streaming oracle must not synchronize the device per chunk.
 
@@ -1352,6 +1376,7 @@ __all__ = [
     'test_fp8_state_storage_ledger',
     'test_recall_efficiency_ratio_sweep',
     'test_online_softmax_shared_kv_tiling',
+    'test_repository_lint_is_enforced',
     'test_online_softmax_streaming_no_host_sync',
     'test_interaction_planning_is_four_cell_budgeted',
 ]

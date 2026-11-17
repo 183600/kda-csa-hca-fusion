@@ -297,6 +297,9 @@ def main():
     # CUDA hot-path contract: +inf handling must be branch-free (no
     # per-chunk ``bool(tensor.any())`` device synchronization).
     all_results += _run_safe(test_online_softmax_streaming_no_host_sync, device)
+    # Static hygiene (ci_lint.py) is part of the pytest gate too, so a
+    # bare except / missing docstring / orphan module cannot slip through.
+    all_results += _run_safe(test_repository_lint_is_enforced, device)
     # Planning-layer contract: a pre-registered 2x2 interaction is a
     # four-cell contrast and cannot borrow the main-effect seed budget.
     all_results += _run_safe(test_interaction_planning_is_four_cell_budgeted,
