@@ -167,6 +167,54 @@ def test_positive_infinity_scores_use_the_softmax_limit():
             f'max|g|={grad.abs().max().item():.2e}')
 
 
+def test_streaming_path_never_forces_a_host_synchronization():
+    """``+inf`` handling must not gate on ``bool(tensor.any())``.
+
+    The CUDA hot path merges one state per key chunk.  A data-dependent
+    Python branch (``if bool(pos_inf.any())``) synchronizes the device on
+    every chunk, which serializes a Flash-style kernel schedule.  The
+    special-case arithmetic is therefore branch-free; this pins that by
+    forbidding ``Tensor.__bool__`` during the whole streaming call.
+    """
+    B, H, T, N, D = 2, 2, 6, 7, 8
+    torch.manual_seed(17)
+    q = torch.randn(B, H, T, D)
+    k = torch.randn(B, H, N, D)
+    v = torch.randn(B, H, N, D)
+    # Exercise the +inf limit as well as ordinary finite rows.
+    q[:, :, 1, :] = 1e20
+    k[:, :, 1, :] = 1e20
+    mask = torch.ones(T, N, dtype=torch.bool)
+    mask[2, :] = False  # one all-masked row -> the empty-row branch
+
+    want_state = online_softmax_state(q, k, v, mask=mask)
+    want_out = online_softmax_attention(
+        q, k, v, mask=mask, key_chunk=2, query_chunk=2)
+
+    orig_bool = torch.Tensor.__bool__
+
+    def _no_host_sync(self):
+        raise AssertionError(
+            'streaming online-softmax path called bool(tensor); this '
+            'synchronizes the device and defeats key-chunk streaming')
+
+    torch.Tensor.__bool__ = _no_host_sync
+    try:
+        got_state = online_softmax_state(q, k, v, mask=mask)
+        online_softmax_merge(got_state, got_state)
+        got_out = online_softmax_attention(
+            q, k, v, mask=mask, key_chunk=2, query_chunk=2)
+    finally:
+        torch.Tensor.__bool__ = orig_bool
+
+    _ok('state has no host sync and is unchanged',
+        all(torch.equal(a, b) for a, b in zip(got_state, want_state)),
+        'state triple differs')
+    _ok('tiled attention has no host sync and is unchanged',
+        bool((got_out - want_out).abs().max() < 1e-6),
+        f'max|d|={(got_out - want_out).abs().max().item():.2e}')
+
+
 def test_all_positive_infinity_scores_average_all_values():
     """An all-``+inf`` row is uniform over every key, not NaN."""
     B, H, T, N, D = 1, 1, 2, 3, 4
@@ -344,6 +392,7 @@ _TEST_FUNCS = [
     test_masked_reference_matches_dense_reference,
     test_positive_infinity_scores_use_the_softmax_limit,
     test_all_positive_infinity_scores_average_all_values,
+    test_streaming_path_never_forces_a_host_synchronization,
     test_per_batch_sink_broadcasts_over_heads_when_b_equals_h,
     test_per_batch_sink_survives_query_tiling_with_b_not_h,
     test_shared_kv_mqa_gqa_and_query_tiling,

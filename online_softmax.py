@@ -128,16 +128,20 @@ def online_softmax_merge(state_a: tuple, state_b: tuple) -> tuple:
     pos_inf_a = torch.isposinf(m_a)
     pos_inf_b = torch.isposinf(m_b)
     pos_inf = pos_inf_a | pos_inf_b
-    if bool(pos_inf.any()):
-        both = pos_inf_a & pos_inf_b
-        den_inf = torch.where(
-            both, den_a + den_b,
-            torch.where(pos_inf_a, den_a, den_b))
-        acc_inf = torch.where(
-            both, acc_a + acc_b,
-            torch.where(pos_inf_a, acc_a, acc_b))
-        den = torch.where(pos_inf, den_inf, den)
-        acc = torch.where(pos_inf, acc_inf, acc)
+    # Branch-free on purpose: ``bool(pos_inf.any())`` would force a
+    # device-to-host synchronization on every merged key chunk, which
+    # defeats the point of a streaming (Flash-style) kernel.  The select
+    # below is a no-op for rows without a ``+inf`` max and is exact for
+    # the rows that have one.
+    both = pos_inf_a & pos_inf_b
+    den_inf = torch.where(
+        both, den_a + den_b,
+        torch.where(pos_inf_a, den_a, den_b))
+    acc_inf = torch.where(
+        both, acc_a + acc_b,
+        torch.where(pos_inf_a, acc_a, acc_b))
+    den = torch.where(pos_inf, den_inf, den)
+    acc = torch.where(pos_inf, acc_inf, acc)
     return m, den, acc
 
 
@@ -211,24 +215,24 @@ def online_softmax_state(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     m = scores.amax(dim=-1, keepdim=True)
     pos_inf = torch.isposinf(scores)
     has_pos_inf = pos_inf.any(dim=-1, keepdim=True)
-    if bool(has_pos_inf.any()):
-        # ``+inf`` scores make ``scores - m`` an ``inf - inf`` NaN. Keep
-        # the ordinary softmax for finite rows and use the limit (mass
-        # split evenly over the +inf entries) on the others. Empty rows
-        # also get a finite shift so the discarded ``exp`` branch cannot
-        # poison backward.
-        empty = torch.isneginf(m)
-        special = empty | has_pos_inf
-        m_safe = torch.where(special, torch.zeros_like(m), m)
-        shifted = scores - m_safe
-        shifted = torch.where(special, torch.zeros_like(shifted), shifted)
-        p = shifted.exp()
-        p = torch.where(empty, torch.zeros_like(p), p)
-        p = torch.where(has_pos_inf, pos_inf.to(p.dtype), p)
-    else:
-        shifted = scores - m
-        p = torch.where(torch.isneginf(m), torch.zeros_like(shifted),
-                        shifted.exp())
+    # Always take the numerically-special path instead of gating it on
+    # ``bool(has_pos_inf.any())``.  That gate synchronized the device on
+    # every chunk; the elementwise selects below are cheap, are exact
+    # no-ops for ordinary finite rows, and keep the +inf / all-masked
+    # limits unchanged.
+    #
+    # ``+inf`` scores make ``scores - m`` an ``inf - inf`` NaN. Keep the
+    # ordinary softmax for finite rows and use the limit (mass split
+    # evenly over the +inf entries) on the others. Empty rows also get a
+    # finite shift so the discarded ``exp`` branch cannot poison backward.
+    empty = torch.isneginf(m)
+    special = empty | has_pos_inf
+    m_safe = torch.where(special, torch.zeros_like(m), m)
+    shifted = scores - m_safe
+    shifted = torch.where(special, torch.zeros_like(shifted), shifted)
+    p = shifted.exp()
+    p = torch.where(empty, torch.zeros_like(p), p)
+    p = torch.where(has_pos_inf, pos_inf.to(p.dtype), p)
     den = p.sum(dim=-1, keepdim=True)
     acc = torch.einsum('b h t n, b h n d -> b h t d', p, v)
     return m, den, acc

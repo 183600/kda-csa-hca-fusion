@@ -294,6 +294,9 @@ def main():
     # Exp 5 ratio sweep: accuracy-vs-decode-traffic efficiency/Pareto wiring.
     all_results += _run_safe(test_recall_efficiency_ratio_sweep, device)
     all_results += _run_safe(test_online_softmax_shared_kv_tiling, device)
+    # CUDA hot-path contract: +inf handling must be branch-free (no
+    # per-chunk ``bool(tensor.any())`` device synchronization).
+    all_results += _run_safe(test_online_softmax_streaming_no_host_sync, device)
     # Planning-layer contract: a pre-registered 2x2 interaction is a
     # four-cell contrast and cannot borrow the main-effect seed budget.
     all_results += _run_safe(test_interaction_planning_is_four_cell_budgeted,

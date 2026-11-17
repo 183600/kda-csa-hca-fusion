@@ -1174,6 +1174,58 @@ def test_online_softmax_shared_kv_tiling(device='cpu'):
     return results
 
 
+def test_online_softmax_streaming_no_host_sync(device='cpu'):
+    """The streaming oracle must not synchronize the device per chunk.
+
+    ``online_softmax_state`` used to wrap its ``+inf`` handling in
+    ``if bool(has_pos_inf.any()):``.  ``bool()`` on a CUDA tensor forces a
+    device-to-host copy, i.e. one full sync per key chunk in
+    ``_stream_keys`` — the opposite of the Flash/Triton schedule this
+    module exists to certify.  The arithmetic is branch-free now; this
+    check forbids ``Tensor.__bool__`` for the whole state/merge/attention
+    path and verifies the result is unchanged on finite, ``+inf`` and
+    all-masked rows.
+    """
+    import torch
+    import online_softmax as osf
+
+    torch.manual_seed(1701)
+    B, H, T, N, D = 2, 2, 6, 7, 8
+    q = torch.randn(B, H, T, D, device=device)
+    k = torch.randn(B, H, N, D, device=device)
+    v = torch.randn(B, H, N, D, device=device)
+    q[:, :, 1, :] = 1e20
+    k[:, :, 1, :] = 1e20
+    mask = torch.ones(T, N, dtype=torch.bool, device=device)
+    mask[2, :] = False
+
+    want_state = osf.online_softmax_state(q, k, v, mask=mask)
+    want_out = osf.online_softmax_attention(
+        q, k, v, mask=mask, key_chunk=2, query_chunk=2)
+
+    orig_bool = torch.Tensor.__bool__
+
+    def _no_host_sync(self):
+        raise AssertionError('bool(tensor) forced a host synchronization')
+
+    torch.Tensor.__bool__ = _no_host_sync
+    try:
+        got_state = osf.online_softmax_state(q, k, v, mask=mask)
+        osf.online_softmax_merge(got_state, got_state)
+        got_out = osf.online_softmax_attention(
+            q, k, v, mask=mask, key_chunk=2, query_chunk=2)
+    finally:
+        torch.Tensor.__bool__ = orig_bool
+
+    state_same = all(
+        torch.equal(a, b) for a, b in zip(got_state, want_state))
+    out_diff = (got_out - want_out).abs().max().item()
+    return [_ok(
+        'online softmax streaming path has no host sync',
+        state_same and out_diff < 1e-6,
+        f'state_exact={state_same}, out max|d|={out_diff:.2e}')]
+
+
 def test_interaction_planning_is_four_cell_budgeted(device='cpu'):
     """A pre-registered 2x2 interaction must not reuse the main-effect SD.
 
@@ -1300,5 +1352,6 @@ __all__ = [
     'test_fp8_state_storage_ledger',
     'test_recall_efficiency_ratio_sweep',
     'test_online_softmax_shared_kv_tiling',
+    'test_online_softmax_streaming_no_host_sync',
     'test_interaction_planning_is_four_cell_budgeted',
 ]
