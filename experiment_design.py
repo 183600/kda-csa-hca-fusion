@@ -702,6 +702,246 @@ PLANS: dict[str, dict] = {
             'cell_keys': ['m', 'm2'],
         },
     },
+    'exp10_memory_hparam': {
+        'plan_id': 'exp10_memory_hparam',
+        'title': ('Exp 10 - memory-operator internal hyperparameter ablation '
+                  '(KDA chunk_size/decay_scale/decay_init, Mamba-2 '
+                  'd_state/expand/headdim)'),
+        'runner': 'run_memory_hparam_ablation.py',
+        'result_files': ['results/exp10_memory_hparam_ablation.json',
+                         'results/exp10_memory_hparam_contrasts.json',
+                         'results/exp10_memory_hparam_provenance.json'],
+        'question': (
+            'Do the internal hyperparameters of the recurrent memory '
+            'operators change MQAR accuracy independently of operator '
+            'identity, and does any geometry dominate the reference at a '
+            'matched parameter budget?'),
+        'design': (
+            'one-factor-at-a-time grid per operator around a reference, at '
+            'fixed 3:1:1 hybrid depth (5 layers); KDA grid crosses '
+            'kda_chunk_size x kda_decay_scale x kda_decay_init and the '
+            'Mamba-2 grid crosses mamba_d_state x mamba_expand x '
+            'mamba_headdim; every arm is paired with its own reference by '
+            'seed; a parameter-capacity audit labels arms outside 5% as '
+            'operator_plus_capacity'),
+        'unit': ('one trained hybrid stack at one (operator, geometry-arm, '
+                 'seed)'),
+        'factors': {
+            'operator': {
+                'role': 'treatment',
+                'levels': ['kda', 'mamba2'],
+            },
+            'kda_chunk_size': {'role': 'treatment', 'levels': [32, 64, 128]},
+            'kda_decay_scale': {'role': 'treatment', 'levels': [0.05, 0.1, 0.2]},
+            'kda_decay_init': {'role': 'treatment',
+                               'levels': ['default', 'log_uniform']},
+            'mamba_d_state': {'role': 'treatment', 'levels': [16, 64, 256]},
+            'mamba_expand': {'role': 'treatment', 'levels': [1, 2, 4]},
+            'mamba_headdim': {'role': 'treatment', 'levels': [32, 64, 128]},
+            'seed': {'role': 'block', 'levels': '42 .. 42 + n_seeds - 1'},
+        },
+        'required_levels': {},
+        'primary_contrast': (
+            'each geometry arm minus its operator reference, seed-paired, '
+            'one-sided within a pre-registered direction when the geometry '
+            'is predicted to help, two-sided otherwise; Bonferroni within '
+            'each operator family; TOST at the 0.05 equivalence margin'),
+        'endpoint': 'final_acc',
+        'direction': 'higher_is_better',
+        'sesoi': 0.10,
+        'assumed_sd': DEFAULT_ASSUMED_SD,
+        'alpha': DEFAULT_ALPHA,
+        # KDA grid has 18 arms (17 vs reference), Mamba-2 has 27 (26 vs
+        # reference); planning with the larger family is conservative.
+        'planned_family_size': 27,
+        'alternative': 'two-sided',
+        'target_power': DEFAULT_TARGET_POWER,
+        'screening_seeds': 5,
+        'planned_seeds': 16,
+        'equivalence': {
+            'margin': 0.05,
+            'family_size': 27,
+            'alpha': DEFAULT_ALPHA,
+            'required_for_claim': False,
+            'source': ('run_memory_hparam_ablation.MH_EQUIV_MARGIN'),
+            'note': ('TOST is applied per arm vs its own reference under the '
+                     'run-wide Bonferroni family; the 7-seed budget is sized '
+                     'for the 0.10 superiority SESOI, so equivalence at 0.05 '
+                     'is reported but not powered'),
+        },
+        'analysis': (
+            'seed-paired t-test under one Bonferroni family per operator; '
+            'TOST at the pre-specified equivalence margin as a secondary '
+            'endpoint; parameter-capacity audit on every arm'),
+        'decision_rule': (
+            'only significant_bonferroni=True contrast rows support a '
+            'geometry claim; capacity-mismatched arms are operator_plus_'
+            'capacity and cannot be quoted as capacity-neutral mechanism '
+            'results'),
+        'stopping_rule': (
+            'fixed geometry grid, depth, recipe and seed count fixed before '
+            'the run; no optional stopping and no dropping an arm after '
+            'seeing its accuracy'),
+        'pilot': {
+            'group_key': 'operator',
+            'reference': 'kda',
+            'cell_keys': ['kda_chunk_size', 'kda_decay_scale',
+                          'kda_decay_init', 'mamba_d_state', 'mamba_expand',
+                          'mamba_headdim'],
+        },
+    },
+    'exp11_compression': {
+        'plan_id': 'exp11_compression',
+        'title': ('Exp 11 - CSA/HCA compression-ratio ablation '
+                  '(csa_m/csa_topk/csa_c, hca_m2/hca_c)'),
+        'runner': 'run_compression_ablation.py',
+        'result_files': ['results/exp11_compression_ablation.json',
+                         'results/exp11_compression_contrasts.json',
+                         'results/exp11_compression_provenance.json'],
+        'question': (
+            'How much of CSA/HCA quality comes from the compression ratio '
+            'itself versus the retrieval/aggregation mechanism, and what is '
+            'the quality-vs-latency tradeoff across compression settings?'),
+        'design': (
+            'one-factor-at-a-time grid around the Exp-5 reference at fixed '
+            '3:1:1 hybrid depth (5 layers); CSA grid crosses csa_m x '
+            'csa_topk x csa_c and HCA grid crosses hca_m2 x hca_c; every '
+            'arm is paired with the reference by seed; a parameter-capacity '
+            'audit labels arms outside 5% as operator_plus_capacity'),
+        'unit': ('one trained hybrid stack at one (compression-arm, seed)'),
+        'factors': {
+            'csa_m': {'role': 'treatment', 'levels': [8, 16, 32, 64]},
+            'csa_topk': {'role': 'treatment', 'levels': [1, 4, 8]},
+            'csa_c': {'role': 'treatment', 'levels': [32, 64, 128]},
+            'hca_m2': {'role': 'treatment', 'levels': [32, 64, 128, 256]},
+            'hca_c': {'role': 'treatment', 'levels': [32, 64, 128]},
+            'seed': {'role': 'block', 'levels': '42 .. 42 + n_seeds - 1'},
+        },
+        'required_levels': {},
+        'primary_contrast': (
+            'each compression arm minus the reference, seed-paired, '
+            'two-sided; Bonferroni within each family (CSA / HCA); TOST at '
+            'the 0.05 equivalence margin'),
+        'endpoint': 'final_acc',
+        'direction': 'higher_is_better',
+        'sesoi': 0.10,
+        'assumed_sd': DEFAULT_ASSUMED_SD,
+        'alpha': DEFAULT_ALPHA,
+        # CSA grid has 10 non-reference arms, HCA has 6; planning with the
+        # larger family (10) is conservative.
+        'planned_family_size': 10,
+        'alternative': 'two-sided',
+        'target_power': DEFAULT_TARGET_POWER,
+        'screening_seeds': 5,
+        'planned_seeds': 14,
+        'equivalence': {
+            'margin': 0.05,
+            'family_size': 10,
+            'alpha': DEFAULT_ALPHA,
+            'required_for_claim': False,
+            'source': ('run_compression_ablation.CC_EQUIV_MARGIN'),
+            'note': ('TOST is applied per arm vs the reference under the '
+                     'run-wide Bonferroni family; the 7-seed budget is sized '
+                     'for the 0.10 superiority SESOI, so equivalence at 0.05 '
+                     'is reported but not powered'),
+        },
+        'analysis': (
+            'seed-paired t-test under one Bonferroni family per operator '
+            'family (CSA / HCA); TOST at the pre-specified equivalence '
+            'margin as a secondary endpoint; parameter-capacity audit on '
+            'every arm'),
+        'decision_rule': (
+            'only significant_bonferroni=True contrast rows support a '
+            'compression claim; capacity-mismatched arms are '
+            'operator_plus_capacity and cannot be quoted as capacity-neutral '
+            'mechanism results'),
+        'stopping_rule': (
+            'fixed compression grid, depth, recipe and seed count fixed '
+            'before the run; no optional stopping and no dropping an arm '
+            'after seeing its accuracy'),
+        'pilot': {
+            'group_key': 'compression_family',
+            'reference': 'csa_m=16,csa_topk=8,csa_c=64,hca_m2=64,hca_c=64',
+            'cell_keys': ['csa_m', 'csa_topk', 'csa_c', 'hca_m2', 'hca_c'],
+        },
+    },
+    'exp12_longseq': {
+        'plan_id': 'exp12_longseq',
+        'title': ('Exp 12 - long-sequence MQAR quality comparison '
+                  '(seq_len 16 -> 1024)'),
+        'runner': 'run_longseq_quality.py',
+        'result_files': ['results/exp12_longseq_quality.json',
+                         'results/exp12_longseq_contrasts.json',
+                         'results/exp12_longseq_provenance.json'],
+        'question': (
+            'Which operator degrades least as the cue-to-target distance '
+            'grows, and what is the quality-vs-latency frontier at long '
+            'range (where softmax O(T) state and compressed retrieval are '
+            'genuinely differentiated)?'),
+        'design': (
+            'seed-blocked grid over seq_len x operator at fixed 5-layer '
+            'depth; operators are memory(KDA), csa, hca, hybrid(3:1:1) and '
+            'softmax; seq_len in {16, 64, 256, 512, 1024}; every (operator, '
+            'length) cell is trained from scratch over the same seed list; '
+            'each cell is contrasted against the same operator at T=16, and '
+            'cross-operator contrasts are computed at each length'),
+        'unit': ('one trained model at one (operator, seq_len, seed)'),
+        'factors': {
+            'seq_len': {'role': 'treatment', 'levels': [16, 64, 256, 512,
+                                                       1024]},
+            'operator': {'role': 'treatment',
+                         'levels': ['memory', 'csa', 'hca', 'hybrid',
+                                    'softmax']},
+            'seed': {'role': 'block', 'levels': '42 .. 42 + n_seeds - 1'},
+        },
+        'required_levels': {},
+        'primary_contrast': (
+            'each (operator, length) cell vs the same operator at T=16, '
+            'seed-paired, two-sided; Bonferroni within each operator family '
+            'over lengths; cross-operator (hybrid vs each alternative) at '
+            'each length, two-sided'),
+        'endpoint': 'final_acc',
+        'direction': 'higher_is_better',
+        'sesoi': 0.10,
+        'assumed_sd': DEFAULT_ASSUMED_SD,
+        'alpha': DEFAULT_ALPHA,
+        # 5 operators x 4 non-reference lengths = 20 within-operator
+        # contrasts plus cross-operator rows at each length; family of 24
+        # keeps the two-sided tests honest.
+        'planned_family_size': 24,
+        'alternative': 'two-sided',
+        'target_power': DEFAULT_TARGET_POWER,
+        'screening_seeds': 5,
+        'planned_seeds': 16,
+        'equivalence': {
+            'margin': 0.05,
+            'family_size': 24,
+            'alpha': DEFAULT_ALPHA,
+            'required_for_claim': False,
+            'source': ('run_longseq_quality.LS_EQUIV_MARGIN'),
+            'note': ('TOST is applied per cell vs T=16 under the run-wide '
+                     'Bonferroni family; the 7-seed budget is sized for the '
+                     '0.10 superiority SESOI, so equivalence at 0.05 is '
+                     'reported but not powered'),
+        },
+        'analysis': (
+            'seed-paired t-test under one Bonferroni family per operator '
+            'over lengths; cross-operator contrasts at each length; TOST at '
+            'the pre-specified equivalence margin as a secondary endpoint'),
+        'decision_rule': (
+            'only significant_bonferroni=True contrast rows support a '
+            'length or cross-operator claim; non-significance is '
+            'inconclusive, never evidence of no difference'),
+        'stopping_rule': (
+            'fixed length grid, operator set, depth, recipe and seed count '
+            'fixed before the run; no optional stopping and no dropping a '
+            'cell after seeing its accuracy'),
+        'pilot': {
+            'group_key': 'operator',
+            'reference': 'hybrid',
+            'cell_keys': ['seq_len', 'operator'],
+        },
+    },
 }
 
 PLAN_IDS = tuple(PLANS)
@@ -2058,12 +2298,18 @@ def planning_report(plan, *, seeds=None, family_size=None, sd=None,
         'equivalence_claim_allowed': (
             None if equivalence is None
             else equivalence['supports_equivalence_at_planned_n']),
+        'equivalence_descriptive_not_confirmatory': (
+            None if equivalence is None
+            else not equivalence.get('required_for_claim', False)),
         'interaction': interaction,
         'interaction_status': (
             None if interaction is None else interaction['status']),
         'interaction_claim_allowed': (
             None if interaction is None
             else interaction['supports_interaction_at_planned_n']),
+        'interaction_descriptive_not_confirmatory': (
+            None if interaction is None
+            else not interaction.get('required_for_claim', False)),
         'method': ('normal approximation for planning only: '
                    'n = ceil(((z_crit + z_power) / (SESOI / SD))^2); '
                    'inference uses the exact/t tests in multi_seed_stats'),
@@ -2248,12 +2494,18 @@ def _planning_report_baseline(plan) -> dict:
         'equivalence_claim_allowed': (
             None if equivalence is None
             else equivalence['supports_equivalence_at_planned_n']),
+        'equivalence_descriptive_not_confirmatory': (
+            None if equivalence is None
+            else not equivalence.get('required_for_claim', False)),
         'interaction': interaction,
         'interaction_status': (
             None if interaction is None else interaction['status']),
         'interaction_claim_allowed': (
             None if interaction is None
             else interaction['supports_interaction_at_planned_n']),
+        'interaction_descriptive_not_confirmatory': (
+            None if interaction is None
+            else not interaction.get('required_for_claim', False)),
         'method': ('normal approximation for planning only: '
                    'n = ceil(((z_crit + z_power) / (SESOI / SD))^2); '
                    'inference uses the exact/t tests in multi_seed_stats'),
