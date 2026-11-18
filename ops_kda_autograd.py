@@ -43,7 +43,7 @@ output):
     dv_t     = ddelta_t
     dbeta_t  = sum_K dbk_t * k_t
     dS_prev  = dD_t * P_t                  (through D = S_prev * P)
-    dg_t     = sum_V(dD_t * S_prev) * P_t  (chain rule through exp)
+    dg_t     = sum_V(dD_t * D_t)           (chain rule: dD/dg = D through exp)
 
 Scope / limitations
 -------------------
@@ -309,7 +309,7 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
         dk_t = dk_t - (D @ ddelta.unsqueeze(-1)).squeeze(-1)
         dk[:, t] = dk_t
         dS = torch.mul(dD, P.unsqueeze(-1), out=dS)
-        dg[:, t] = (dD * S_prev).sum(-1) * P
+        dg[:, t] = (dD * D).sum(-1)
     return dS
 
 
