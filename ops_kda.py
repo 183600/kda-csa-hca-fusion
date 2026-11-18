@@ -597,6 +597,15 @@ def naive_recurrent_kda(
     q, k, v, g, beta = map(lambda x: x.to(compute_dtype), [q, k, v, g, beta])
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
+    # Upper-bound clamp: KDA's g is per-channel log-decay (Eq. 7 in
+    # arXiv:2510.26692: g = -softplus(u) * decay_scale), which MUST be
+    # non-positive. Positive g makes exp(g) > 1, causing exponential
+    # state growth and numerical divergence (the recurrent and chunk
+    # paths amplify instability differently and cease to agree).
+    # The hybrid layer computes g = -softplus(...) * scale (always <= 0),
+    # so this clamp is a no-op for in-model usage but protects direct
+    # callers from passing unconstrained random g values.
+    g = g.clamp(max=0.0)
     # GVA expansion. With G == 1 (H == HV) the repeat_interleave is an
     # identity operation; values are unchanged.
     if G == 1:
@@ -1047,6 +1056,10 @@ def _chunk_kda_prepare(
     # ``g`` is never mutated.
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
+    # Upper-bound clamp: KDA's g is per-channel log-decay and MUST be
+    # non-positive (see the comment in ``naive_recurrent_kda``). Applied
+    # before padding so the padded zeros remain at zero (identity decay).
+    g = g.clamp(max=0.0)
     pad = (-T) % BT
     if pad:
         q    = F.pad(q,    (0, 0, 0, 0, 0, pad))

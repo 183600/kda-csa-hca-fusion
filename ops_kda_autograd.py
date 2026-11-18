@@ -441,6 +441,9 @@ def custom_recurrent_kda(
     q, k, v, g, beta = map(lambda x: x.to(compute_dtype), [q, k, v, g, beta])
     if g_clamp_min > -float('inf'):
         g = g.clamp(min=float(g_clamp_min))
+    # Upper-bound clamp: g is per-channel log-decay and must be non-positive.
+    # See the comment in ops_kda.naive_recurrent_kda for the full rationale.
+    g = g.clamp(max=0.0)
     if G == 1:
         q = q * scale
     else:
