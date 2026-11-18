@@ -351,7 +351,7 @@ class GatedDeltaRule(nn.Module):
         beta_init: float = 0.1,
         g_init: float = -2.0,  # exp(-2) ≈ 0.135, moderate decay
         g_clamp_min: float = -10.0,
-        g_clamp_max: float = 50.0,
+        g_clamp_max: float = 0.0,
     ):
         super().__init__()
         self.num_heads = _require_positive_int('num_heads', num_heads)
@@ -374,16 +374,23 @@ class GatedDeltaRule(nn.Module):
                 f'g_clamp_min={self.g_clamp_min!r} must be <= '
                 f'g_clamp_max={self.g_clamp_max!r}.')
 
-        # Learnable log-gate (g) and beta
+        # Learnable log-gate (g) and beta.
+        # Beta is stored in logit space and sigmoid-applied during forward,
+        # matching KDA's beta = sigmoid(linear(x)) constraint to [0, 1].
+        # This prevents unbounded update magnitudes that could destabilize
+        # the recurrent state (the delta-rule is only numerically bounded
+        # when beta ∈ [0, 1] and q/k are unit-norm).
+        import math as _init_math
+        _beta_logit = _init_math.log(self.beta_init / max(1.0 - self.beta_init, 1e-8))
         if gate_type == 'per_channel':
             self.g = nn.Parameter(
                 torch.full((num_heads, key_dim), self.g_init))
             self.beta = nn.Parameter(
-                torch.full((num_heads,), self.beta_init))
+                torch.full((num_heads,), _beta_logit))
         elif gate_type == 'per_head':
             self.g = nn.Parameter(torch.full((num_heads,), self.g_init))
             self.beta = nn.Parameter(
-                torch.full((num_heads,), self.beta_init))
+                torch.full((num_heads,), _beta_logit))
         else:
             raise ValueError(f"gate_type={gate_type!r} must be 'per_head' or 'per_channel'")
         # Inference-time cache for per-channel gate exp to avoid repeated clamp+exp
@@ -489,7 +496,11 @@ class GatedDeltaRule(nn.Module):
         else:  # per_head
             gate_state = gate.view(1, H, 1, 1)
 
-        beta = self.beta.view(1, H, 1, 1)  # [1, H, 1, 1]
+        # Apply sigmoid to constrain beta to [0, 1], matching KDA's
+        # beta = sigmoid(linear(x)) contract. Without this, unbounded
+        # beta values can cause the delta-rule update to overshoot and
+        # destabilize the recurrent state.
+        beta = torch.sigmoid(self.beta).view(1, H, 1, 1)  # [1, H, 1, 1]
 
         # Initialize state
         if initial_state is None:
@@ -602,7 +613,10 @@ def gated_delta_rule_step(
         k_t: [B, H, K] key
         v_t: [B, H, V] value
         gate: [H, K] or [H] gate values (already exp()'ed)
-        beta: [H] learning rates
+        beta: [H] learning rates, should be in [0, 1] (post-sigmoid).
+            The module-level API (GatedDeltaRule.forward) applies sigmoid
+            automatically; callers of this functional API must pass
+            already-sigmoided values for numerical stability.
         gate_type: 'per_channel' | 'per_head'
 
     Returns:
