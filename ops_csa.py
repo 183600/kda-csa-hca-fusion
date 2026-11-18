@@ -1210,8 +1210,25 @@ def _sink_softmax(scores, log_sink, all_masked_mask=None, *,
         shifted = shifted.masked_fill(all_masked, 0.0)
     else:
         shifted.masked_fill_(all_masked, 0.0)
+    # Fix: for PARTIALLY masked rows (some valid scores + some ``-inf``
+    # masked entries), the ``-inf`` entries in ``shifted`` must NOT
+    # contribute to the logsumexp denominator. ``masked_fill(all_masked, 0)``
+    # above only handles FULLY-masked rows. For partially masked rows the
+    # ``-inf`` entries stay at ``-inf`` in ``shifted``, but ``torch.logsumexp``
+    # may handle ``-inf`` inconsistently across backends (some return
+    # ``log(sum of finite exp)`` correctly, others produce NaN gradients in
+    # backward). Build a finite safe version for logsumexp: replace ``-inf``
+    # with a large negative finite value (``-1e4``) whose ``exp`` is
+    # negligible (~0 in every dtype), so the logsumexp is dominated by the
+    # valid entries only. This is mathematically equivalent to the correct
+    # softmax where masked entries receive zero probability.
+    _LSE_NEG_INF_REPLACEMENT = -1e4
+    shifted_for_lse = torch.where(
+        torch.isneginf(shifted),
+        torch.full_like(shifted, _LSE_NEG_INF_REPLACEMENT),
+        shifted)
     shifted_sink = log_sink - row_max_safe
-    log_sum_exp = torch.logsumexp(shifted, dim=-1, keepdim=True)
+    log_sum_exp = torch.logsumexp(shifted_for_lse, dim=-1, keepdim=True)
     log_denom = torch.logaddexp(log_sum_exp, shifted_sink)
     if torch.is_grad_enabled():
         p = (shifted - log_denom).exp()
