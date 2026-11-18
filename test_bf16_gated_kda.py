@@ -345,11 +345,19 @@ def test_gated_delta_rule_module_matches_step_for_high_precision_params():
     o, S = layer(q, k, v, initial_state=init)
     gate = layer.g.clamp(
         min=layer.g_clamp_min, max=layer.g_clamp_max).exp()
+    # GatedDeltaRule.forward applies sigmoid to self.beta internally
+    # (constraining the delta-rule learning rate to [0, 1] for numerical
+    # stability). gated_delta_rule_step expects already-sigmoided beta
+    # (see its docstring: "The module-level API applies sigmoid
+    # automatically; callers of this functional API must pass
+    # already-sigmoided values"). Apply sigmoid here so the step-by-step
+    # reference uses the same beta values as the module.
+    beta_sigmoid = torch.sigmoid(layer.beta)
     S_step = init.clone()
     outs = []
     for t in range(T):
         o_t, S_step = gated_delta_rule_step(
-            S_step, q[:, t], k[:, t], v[:, t], gate, layer.beta)
+            S_step, q[:, t], k[:, t], v[:, t], gate, beta_sigmoid)
         outs.append(o_t)
     ref = torch.stack(outs, dim=1)
 
