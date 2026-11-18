@@ -901,10 +901,14 @@ def _chunk_kda_attn_loop_eager(
     identical elementwise sub/clamp/exp/multiply chain followed by a
     reduction over the last dim (the same mathematical contraction) as the
     one-row-at-a-time form, so the values agree up to the reduction
-    kernel's floating-point association. Entries with ``j > c`` are
-    computed by the block write and then zeroed with ``upper_mask`` (the
-    one-row form left them at their ``torch.zeros`` contents, i.e. exactly
-    ``+0.0``). The Python-level iteration is optionally TorchScript-compiled
+    kernel's floating-point association. When ``block_rows > 1``, entries
+    with ``j > c`` within each block are also written by the batched
+    einsum and are then zeroed by the ``diagonal(offset=off).zero_()``
+    pass at the end of this function (offsets ``1`` through
+    ``block_rows - 1``). When ``block_rows == 1``, each row writes exactly
+    its ``[:c+1]`` prefix and the strict upper triangle remains at the
+    ``torch.zeros`` allocation value (+0.0); the zeroing pass is skipped.
+    The Python-level iteration is optionally TorchScript-compiled
     via :func:`_get_scripted_prep_attn_loop`.
     """
     for c0 in range(0, BT, block_rows):
@@ -1104,11 +1108,16 @@ def _chunk_kda_prepare(
     # NOTE: the main diagonal AND the strict upper triangle of the raw
     # ``A`` must be zeroed (``diagonal=0`` semantics, NOT ``diagonal=1``) to
     # match the FLA-referenced chunkwise-parallel KDA math
-    # (fla/ops/kda/naive.py). Because the loop below writes exactly the lower
-    # triangle of a zero-initialized ``A``, only the written diagonal needs
-    # an explicit zero afterwards; the strict upper triangle is already zero.
-    # ``eye`` / ``upper_mask`` are cached per (BT, dtype, device) — both are
-    # read-only constants (see :func:`_chunk_constants`).
+    # (fla/ops/kda/naive.py). The attention loop below writes the lower
+    # triangle of ``A``; when ``block_rows > 1`` it ALSO writes within-block
+    # upper-triangle entries (``j > c`` within the same row block), which the
+    # loop's diagonal-zeroing pass (``A.diagonal(offset=off).zero_()`` for
+    # ``off`` in ``1..block_rows-1``) cleans up. When ``block_rows == 1``,
+    # each row writes exactly its ``[:c+1]`` prefix so the strict upper
+    # triangle remains at the ``torch.zeros`` allocation value. In both
+    # cases the caller's explicit ``A.diagonal().zero_()`` then zeros the
+    # main diagonal. ``eye`` / ``upper_mask`` are cached per (BT, dtype,
+    # device) — both are read-only constants (see :func:`_chunk_constants`).
     eye, upper_mask = _chunk_constants(BT, compute_dtype, q.device)
     # ``A``'s columns are written only for rows ``c >= i`` below; the
     # never-written upper triangle must be finite zeros (not ``empty``
@@ -1158,10 +1167,16 @@ def _chunk_kda_prepare(
             g, k, q, A, _Aqk_arg, BT, clamp_g_diff, recompute_attn,
             upper_mask, _block_rows)
     A.mul_(beta[..., None])
-    # Only the diagonal needs zeroing: ``A`` was allocated with
-    # ``torch.zeros`` and the loop above wrote exactly its lower triangle
-    # (including the diagonal), so the strict upper triangle is already
-    # +0.0.
+    # Zero the main diagonal: the attention loop wrote the diagonal entries
+    # (the ``c == j`` self-attention scores), which must be removed because
+    # the KDA delta rule applies the correction only to STRICTLY preceding
+    # tokens within the chunk. The strict upper triangle was already zeroed
+    # by the loop's ``diagonal(offset=off).zero_()`` pass when
+    # ``block_rows > 1``; when ``block_rows == 1`` it was never written and
+    # remains at the ``torch.zeros`` allocation value (+0.0). After this
+    # step, ``A`` is strictly lower triangular (all entries with ``j >= c``
+    # are zero), making ``eye - A`` unit lower triangular for the
+    # ``solve_triangular`` call below.
     A.diagonal(dim1=-2, dim2=-1).zero_()
     A.neg_()
     # ``eye - A`` is unit lower triangular (the diagonal zeroing above left
