@@ -253,11 +253,18 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
                     @ S_t.transpose(-1, -2)).squeeze(-2)
         # STE correction for bf16: the forward's ``_bf16_safe_addcmul``
         # clamps ``bk * delta`` to [-1e4, 1e4], so ``S_t = D + clamp(U)``
-        # where ``U = bk * delta``.  When the clamp activates, ``dS_t/dU``
-        # is zero (STE), meaning NO gradient flows from S_t through the
-        # update — neither through the direct ``+D`` path nor through
-        # ``delta = v - k^T D`` (which also depends on D).  Both paths
-        # go through the clamped add, so both must be zeroed.
+        # where ``U = bk * delta``.  When the clamp activates,
+        # ``dS_t/dU = 0`` (STE), meaning no gradient flows from S_t
+        # through the clamped update U — so ``ddelta`` and ``dbk``
+        # (which are gradients through U) must be zeroed.
+        #
+        # However, D has a DIRECT identity path to S_t that does NOT
+        # go through the clamp: ``dS_t/dD = I`` always, regardless of
+        # whether the clamp activates.  The delta-dependent correction
+        # to dD (``-k ⊗ ddelta``) is naturally zero when the clamp
+        # activates (because ``ddelta = 0`` via STE), so ``dD = dS``
+        # without STE masking correctly captures both the direct decay
+        # path and the (zero when clamped) delta correction.
         #
         # For non-bf16 dtypes, not_clamped is None and the correction
         # is skipped (the clamp never activates, preserving bit-exact
@@ -266,20 +273,39 @@ def _custom_kda_backward_loop(q, k, v, g, beta, grad_o, dS, traj,
             dS_effective = dS * not_clamped.to(dS.dtype)
         else:
             dS_effective = dS
+        # ddelta and dbk are gradients through the CLAMPED update U;
+        # use STE-masked dS_effective so they are zeroed when the
+        # clamp activates.
         ddelta = (dS_effective * bk).sum(-2)
         dbk = (dS_effective * delta.unsqueeze(-2)).sum(-1)
         dbeta[:, t] = (dbk * k_t).sum(-1)
         dk_t = dbk * beta_t.unsqueeze(-1)
         dv[:, t] = ddelta
         torch.mul(k_t.unsqueeze(-1), ddelta.unsqueeze(-2), out=scratch)
-        # dD uses dS_effective (the STE-masked adjoint). Both the direct
-        # ``+D`` path and the ``delta = v - k^T D`` path go through the
-        # clamped add ``S_t = D + clamp(bk * delta)``.  When the clamp
-        # activates, dS_t/dD = I - beta * k * k^T = 0 (STE), so dD must
-        # use the masked adjoint.  Using unmasked ``dS`` would leak
-        # gradient through clamped elements into the state decay path,
-        # producing incorrect ``dS_prev`` and ``dg`` for those channels.
-        dD = dS_effective - scratch
+        # dD uses the UNMASKED adjoint dS (NOT dS_effective).  The
+        # forward is ``S_t = D + clamp(bk * delta)``.  Differentiating
+        # w.r.t. D:
+        #
+        #   dS_t/dD = I + d(clamp(U))/dD
+        #
+        # where U = bk * delta and delta = v - k^T D.  When the clamp
+        # activates, d(clamp(U))/dU = 0 (STE), so the second term
+        # vanishes and dS_t/dD = I.  When the clamp is inactive,
+        # d(clamp(U))/dU = I, giving
+        # dS_t/dD = I - beta * k * k^T (the standard delta-rule
+        # Jacobian).  In both cases:
+        #
+        #   dD = dS - k ⊗ ddelta
+        #
+        # where ``ddelta`` is already STE-masked (zero when clamped,
+        # full value otherwise), so ``scratch = k ⊗ ddelta`` is correct
+        # in both regimes.  Using unmasked ``dS`` ensures the direct
+        # decay path ``dS_prev = dD * P`` and ``dg = (dD * S_prev) * P``
+        # always carry the adjoint backward, even when the update is
+        # saturated — without this fix, bf16 training would silently
+        # lose gradient flow through clamped time-steps, causing the
+        # recurrent state to stop learning from earlier positions.
+        dD = dS - scratch
         dk_t = dk_t - (D @ ddelta.unsqueeze(-1)).squeeze(-1)
         dk[:, t] = dk_t
         dS = torch.mul(dD, P.unsqueeze(-1), out=dS)
