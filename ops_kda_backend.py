@@ -478,14 +478,23 @@ def kda_forward(
     # of truth for correctness tests. The resolved symbols are cached on
     # first use so the (reference-path) decode loop does not re-run the
     # import machinery per token.
+    # NOTE: custom_recurrent_kda (from ops_kda_autograd) wraps
+    # naive_recurrent_kda with a single torch.autograd.Function node whose
+    # backward is the analytic adjoint of the delta-rule recurrence.
+    # This reduces the autograd graph depth from O(T) to O(1) and the
+    # retained activation memory from ~6*T*B*HV*K*V to ~1 state per step,
+    # while producing bit-identical forward values and gradients matching
+    # to float round-off (verified by parity tests). The chunk paths use
+    # their own optimized implementations and are not affected.
     global _REFERENCE_OPS
     if _REFERENCE_OPS is None:
         from ops_kda import (assoc_scan_chunk_kda, naive_recurrent_kda,
                              scripted_chunk_kda)
+        from ops_kda_autograd import custom_recurrent_kda
         _REFERENCE_OPS = (assoc_scan_chunk_kda, naive_recurrent_kda,
-                          scripted_chunk_kda)
-    assoc_scan_chunk_kda, naive_recurrent_kda, scripted_chunk_kda = \
-        _REFERENCE_OPS
+                          scripted_chunk_kda, custom_recurrent_kda)
+    assoc_scan_chunk_kda, naive_recurrent_kda, scripted_chunk_kda, \
+        custom_recurrent_kda = _REFERENCE_OPS
 
     if use_chunk:
         if assoc_scan and recompute_attn:
@@ -517,7 +526,12 @@ def kda_forward(
             g_clamp_min=ref_clamp,
             recompute_attn=recompute_attn,
         )
-    return naive_recurrent_kda(
+    # Use the memory-efficient custom autograd path (O(1) graph depth)
+    # instead of the naive path (O(T) graph depth). custom_recurrent_kda
+    # delegates to naive_recurrent_kda under no_grad (no trajectory storage
+    # overhead), so inference performance is unchanged. The forward values
+    # are bit-identical and gradients match to float round-off.
+    return custom_recurrent_kda(
         q, k, v, g, beta,
         scale=scale,
         initial_state=initial_state,
