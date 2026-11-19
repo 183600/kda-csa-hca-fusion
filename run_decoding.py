@@ -1481,6 +1481,25 @@ class HybridDecoding(nn.Module):
             # owns the decode outputs either way.
             states = [s.detach() for s in stacked.unbind(0)]
         else:
+            # When the externally-managed ``self.model._kda_state`` is None
+            # (fresh sequence, batch-size change, or explicit state drop by
+            # the caller), every KDA layer must start from a zero recurrent
+            # state.  However, each KDA layer also carries its OWN
+            # ``self._kda_state`` buffer (the stateful-forward API used by
+            # ``HybridAttentionStack.forward``).  That buffer may still hold
+            # the state from a PREVIOUS call (e.g. a prefill that ran
+            # before the external state was dropped).  If we pass
+            # ``state=None`` to ``KDAHybridLayer.forward()``, it falls back
+            # to reading its own ``self._kda_state`` — which is stale.
+            #
+            # Fix: explicitly clear each layer's internal ``_kda_state``
+            # so the ``state is None → read self._kda_state`` fallback in
+            # ``KDAHybridLayer.forward()`` also yields None (→ zero state).
+            # This makes the externally-managed and internally-persisted
+            # state channels agree: both signal "start fresh".
+            for layer in self.model.memory_layers:
+                if hasattr(layer, '_kda_state'):
+                    layer._kda_state = None
             states = [None] * self.model.n_kda_layers
 
         kda_idx = csa_idx = hca_idx = 0
