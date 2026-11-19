@@ -970,15 +970,31 @@ class KDAHybridLayer(nn.Module):
         # ``.half()`` move/cast it automatically (a plain attribute would be
         # left on the source device / dtype and fail the next forward).
         self.register_buffer('_conv_lookback', None, persistent=False)
+        # Persistent KDA recurrent state buffer of shape
+        # ``[B, HV, K, V]``. This is REQUIRED for streaming / autoregressive
+        # decoding: without carrying the recurrent state between calls, each
+        # chunk starts from a zero state and loses all previously accumulated
+        # memory, producing incorrect outputs for every chunk after the first.
+        #
+        # The stateful ``forward()`` method reads this buffer when no
+        # explicit ``state`` argument is provided, and writes the updated
+        # state back after each call. ``forward_functional()`` takes the
+        # state as an explicit argument and does not touch this buffer.
+        #
+        # Registered as a non-persistent buffer (runtime state, not saved
+        # in checkpoints; reset between sequences via ``reset_conv_state``).
+        self.register_buffer('_kda_state', None, persistent=False)
 
     def reset_conv_state(self) -> None:
-        """Clear the persistent short-conv lookback buffer.
+        """Clear the persistent short-conv lookback AND recurrent state buffers.
 
         Call this between independent sequences so the conv does not "see"
-        tokens from the previous sequence as left context for the next one.
+        tokens from the previous sequence as left context for the next one,
+        and so the KDA recurrent memory starts fresh.
         ``HybridKCHAttention.reset_state`` calls this for every KDA layer.
         """
         self._conv_lookback = None
+        self._kda_state = None
 
     def log_decay_preactivation(self, x_conv: torch.Tensor) -> torch.Tensor:
         """Per-channel gate pre-activation ``u`` of shape ``[B, T, HV*K]``.
@@ -1002,19 +1018,33 @@ class KDAHybridLayer(nn.Module):
     def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
         """Stateful forward.
 
-        Reads ``self._conv_lookback`` and writes the new lookback + new
+        Reads ``self._conv_lookback`` and ``self._kda_state`` (when no
+        explicit ``state`` is given) and writes the new lookback and
         recurrent state back to ``self``. This is the API used by
         ``HybridKCHAttention.forward`` and the experiment runners.
+
+        When ``state`` is ``None`` (the default), the KDA recurrent state
+        is read from ``self._kda_state`` (persisted from the previous
+        call). The updated state is always written back to
+        ``self._kda_state`` so subsequent calls carry the memory forward.
 
         For a **pure / side-effect-free** path (needed for concurrent
         inference, DDP, ``torch.compile``, gradient checkpointing, and
         cross-chunk BPTT), use :meth:`forward_functional` instead — it
-        takes the conv lookback as an argument and returns the new
-        lookback without mutating ``self``.
+        takes the conv lookback and state as explicit arguments and
+        returns the new lookback without mutating ``self``.
         """
+        # Auto-read the persisted recurrent state when the caller does
+        # not provide one explicitly. Without this, consecutive
+        # stateful calls (e.g. streaming / autoregressive decoding)
+        # would each start from a zero state, losing all previously
+        # accumulated memory.
+        if state is None:
+            state = self._kda_state
         o, new_state, new_lookback = self.forward_functional(
             x, state, self._conv_lookback)
         self._conv_lookback = new_lookback
+        self._kda_state = new_state
         return o, new_state
 
     def forward_functional(
