@@ -232,13 +232,26 @@ class SavedBytesProbe:
 def _memory_layer_call(layer, x, state, lookback, detach_lookback: bool):
     """Functional memory-layer call (pure; safe to recompute).
 
-    Suppresses TorchScript-compiled KDA recurrent loops during the call
+    Suppresses TorchScript-compiled KDA recurrent loops AND
+    ``torch.compiler`` (torch._dynamo) auto-compilation during the call
     so that the forward and recompute passes save tensors in the same
-    order.  The JIT-compiled loop (``ops_kda._get_scripted_recurrent_loop``)
-    produces identical *values* but a non-deterministic saved-tensor
-    ordering that breaks ``torch.utils.checkpoint``'s recompute check.
-    The eager loop is bit-identical in value and deterministic in tensor
-    ordering, which is what the checkpoint contract requires.
+    order.  Both sources of non-determinism break
+    ``torch.utils.checkpoint``'s recompute check:
+
+    * The JIT-compiled loop (``ops_kda._get_scripted_recurrent_loop``)
+      produces identical *values* but a non-deterministic saved-tensor
+      ordering.
+    * ``torch.compiler`` (active by default in PyTorch >= 2.6) may
+      auto-compile ``nn.Module`` forward calls, producing different
+      graph captures between the original forward and the checkpoint
+      recompute.  This manifests as ``CheckpointError: Recomputed
+      values have different metadata`` when the chunk KDA path is
+      used (the compiled graph may fuse or reorder tensor creations
+      that the eager path keeps separate).
+
+    The eager, uncompiled path is bit-identical in value and
+    deterministic in tensor ordering, which is what the checkpoint
+    contract requires.
     """
     import ops_kda as _kda
     # Save and suppress the scripted-loop caches so the eager path runs.
@@ -269,8 +282,8 @@ def _memory_layer_call(layer, x, state, lookback, detach_lookback: bool):
         _kda._CHUNK_INNER_SCRIPTED = {}
         _kda._CHUNK_INNER_SCRIPT_FAILED = {}
     try:
-        return layer.forward_functional(
-            x, state, lookback, detach_lookback=detach_lookback)
+        return _memory_layer_inner_forward(
+            layer, x, state, lookback, detach_lookback)
     finally:
         _kda._RECURRENT_LOOP_SCRIPTED = _prev_scripted
         _kda._RECURRENT_LOOP_SCRIPTED_FAILED = _prev_scripted_failed
@@ -285,10 +298,55 @@ def _memory_layer_call(layer, x, state, lookback, detach_lookback: bool):
             _kda._CHUNK_INNER_SCRIPT_FAILED = _prev_chunk_inner_failed
 
 
+def _memory_layer_inner_forward(layer, x, state, lookback, detach_lookback):
+    """Inner forward for :func:`_memory_layer_call`.
+
+    Separated so ``torch.compiler.disable`` can be applied as a
+    decorator.  ``torch.compiler.disable()`` returns a ``DisableContext``
+    that must be entered at function entry — it cannot be entered
+    manually from inside a ``try`` block that the Dynamo-traced
+    checkpoint generator is already managing.  Applying it as a
+    decorator on this inner function ensures the compiler is disabled
+    for the actual ``forward_functional`` call without conflicting
+    with the outer checkpoint machinery.
+    """
+    return layer.forward_functional(
+        x, state, lookback, detach_lookback=detach_lookback)
+
+
+# Apply torch.compiler.disable to prevent auto-compilation from
+# producing different tensor orders between checkpoint forward and
+# recompute.  PyTorch >= 2.6 may implicitly compile nn.Module forward
+# calls, breaking the recompute metadata check.  The decorator is
+# applied after definition so older PyTorch versions (without
+# torch.compiler.disable) still work.
+_disable_compiler = getattr(
+    getattr(torch, 'compiler', None), 'disable', None)
+if callable(_disable_compiler):
+    _memory_layer_inner_forward = _disable_compiler()(
+        _memory_layer_inner_forward)
+
+
 def _stateless_layer_call(layer, x):
-    """CSA / HCA call returning the output tensor only."""
+    """CSA / HCA call returning the output tensor only.
+
+    Suppresses ``torch.compiler`` auto-compilation (same rationale as
+    :func:`_memory_layer_call`): the compiled graph may produce a
+    different saved-tensor order than the eager path, breaking
+    ``torch.utils.checkpoint``'s recompute metadata check.
+    """
+    return _stateless_layer_inner_forward(layer, x)
+
+
+def _stateless_layer_inner_forward(layer, x):
+    """Inner CSA/HCA forward, decorated with ``torch.compiler.disable``."""
     out, _ = layer(x, None)
     return out
+
+
+if callable(_disable_compiler):
+    _stateless_layer_inner_forward = _disable_compiler()(
+        _stateless_layer_inner_forward)
 
 
 def _tagged(probe, kind):
