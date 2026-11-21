@@ -426,6 +426,18 @@ def kda_forward(
     # delta-rule state update.
     if g_clamp_value > -float('inf'):
         g = g.clamp(min=g_clamp_value)
+    # Upper-bound clamp: KDA's g is per-channel log-decay and MUST be
+    # non-positive (g = -softplus(u) * decay_scale <= 0). Positive g
+    # makes exp(g) > 1, causing exponential state growth and numerical
+    # divergence. The reference operators (naive_recurrent_kda,
+    # custom_recurrent_kda, _chunk_kda_prepare) apply their own
+    # g.clamp(max=0.0) internally, but the FLA backend does NOT — it
+    # only accepts g_clamp_min. Apply the upper-bound clamp here so
+    # both backends receive identically bounded g values. This is a
+    # no-op for in-model usage (where g is always <= 0 by construction)
+    # but protects direct callers from passing unconstrained g values
+    # to the FLA kernel.
+    g = g.clamp(max=0.0)
     downstream_clamp = g_clamp_min
     # The reference operators (naive_recurrent_kda / the chunk paths) apply
     # their own ``g_clamp_min`` clamp to ``g``; with the same bound that
