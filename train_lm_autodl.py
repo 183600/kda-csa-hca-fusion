@@ -3996,7 +3996,7 @@ def main():
         if isinstance(submod, (nn.Embedding, nn.LayerNorm)):
             for p in submod.parameters(recurse=False):
                 no_decay_ids.add(id(p))
-    _POSITIONAL_BIAS_SUFFIXES = ('Ba', 'Bb', 'B_idx', 'B_pos')
+    _POSITIONAL_BIAS_SUFFIXES = ('Ba', 'Bb', 'B_idx', 'Bb_idx', 'B_pos')
     decay, no_decay = [], []
     seen = set()
     for name, p in model.named_parameters():
