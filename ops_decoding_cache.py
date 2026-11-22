@@ -1549,21 +1549,36 @@ class CSADecodingCache:
             new_C_rest = _csa_compress_kv_overlapped_prev(
                 Ca_rest, Za_rest, Cb_prev_rest, Zb_prev_rest, Ba, Bb,
             )                                                      # [B, n_rest, c]
+            # Fix: the indexer rest blocks must include the first block's
+            # K_idx/Z_idx as the overlap (b-branch) partner for rest
+            # block 0. Without prepending K_first/Zk_first, the overlapped
+            # compression sees -inf for rest block 0's b-branch (treating
+            # it as if it had no predecessor), producing indexer keys that
+            # disagree with naive_csa's full-sequence compression from
+            # block 1 onward. This caused the bf16 decode-vs-prefill
+            # parity test to fail (top-k selection diverged at block 1+,
+            # producing ~100x the expected tolerance on some seeds).
+            K_first_flat = K_first.reshape(B, m, self.c_I)
+            Zk_first_flat = Zk_first.reshape(B, m, self.c_I)
+            K_rest_with_prev = torch.cat(
+                [K_first_flat,
+                 K_idx_new[:, first_needed:rest_end].reshape(
+                     B, n_rest * m, self.c_I)], dim=1)
+            Z_rest_with_prev = torch.cat(
+                [Zk_first_flat,
+                 Z_idx_new[:, first_needed:rest_end].reshape(
+                     B, n_rest * m, self.c_I)], dim=1)
             new_K_rest = csa_compress_kv_overlapped(
-                K_idx_new[:, first_needed:rest_end].reshape(
-                    B, n_rest * m, self.c_I),
-                K_idx_new[:, first_needed:rest_end].reshape(
-                    B, n_rest * m, self.c_I),
-                Z_idx_new[:, first_needed:rest_end].reshape(
-                    B, n_rest * m, self.c_I),
-                Z_idx_new[:, first_needed:rest_end].reshape(
-                    B, n_rest * m, self.c_I),
+                K_rest_with_prev.reshape(B, (n_rest + 1) * m, self.c_I),
+                K_rest_with_prev.reshape(B, (n_rest + 1) * m, self.c_I),
+                Z_rest_with_prev.reshape(B, (n_rest + 1) * m, self.c_I),
+                Z_rest_with_prev.reshape(B, (n_rest + 1) * m, self.c_I),
                 B_idx, Bb_idx if Bb_idx is not None else B_idx, m,
-            )                                                      # [B, n_rest, c_I]
+            )[:, 1:]                                               # [B, n_rest, c_I]
             last_K_idx = K_idx_new[:, rest_end - m:rest_end].reshape(B, m, self.c_I)
             last_Z_idx = Z_idx_new[:, rest_end - m:rest_end].reshape(B, m, self.c_I)
-            last_Cb = Cb_rest[:, -1]
-            last_Zb = Zb_rest[:, -1]
+            last_Cb = Cb_new[:, rest_end - m:rest_end].reshape(B, m, c)
+            last_Zb = Zb_new[:, rest_end - m:rest_end].reshape(B, m, c)
         else:
             new_C_rest = None
             new_K_rest = None
@@ -2167,7 +2182,7 @@ class CSADecodingCache:
             # Keep the canonical decode step for the singleton case.
             self.append_step(
                 Ca_new, Cb_new, Za_new, Zb_new, K_idx_new, Z_idx_new,
-                Ba, Bb, B_idx)
+                Ba, Bb, B_idx, Bb_idx)
             return self.forward_step(
                 q, q_idx, w_idx, topk=topk, nh=nh, nIh=nIh, scale=scale,
                 sink_logits=sink_logits, use_ste=use_ste,
