@@ -186,6 +186,8 @@ py-modules = [
     "train_toy_reference",
     "ttft_budget",
     "backup_results",
+    "bug_hunt",
+    "deep_bug_hunt",
 ]
 packages = [
     "checks",
