@@ -567,12 +567,23 @@ def _indexer_compress_single(
     K_idx_new: torch.Tensor,  # [B, m, c_I]
     Z_idx_new: torch.Tensor,  # [B, m, c_I]
     B_idx: torch.Tensor,      # [m, c_I]
+    K_idx_prev: torch.Tensor | None = None,  # [B, m, c_I] previous block's K_idx
+    Z_idx_prev: torch.Tensor | None = None,  # [B, m, c_I] previous block's Z_idx
+    Bb_idx: torch.Tensor | None = None,      # [m, c_I] b-branch positional bias
 ) -> torch.Tensor:
-    """Single-branch compression of the indexer keys for ONE new block.
+    """Overlapped two-branch compression of the indexer keys for ONE new block.
 
-    Mirrors the ``csa_compress_kv`` call on indexer keys inside
-    ``naive_csa`` (``K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)``)
-    but operates on a single block.
+    Mirrors the ``csa_compress_kv_overlapped`` call on indexer keys inside
+    ``naive_csa`` (DeepSeek-V4 §2.3.1: "performs the same compression
+    operation used for CComp"). When ``K_idx_prev`` / ``Z_idx_prev`` are
+    provided (non-first blocks), uses overlapped two-branch compression
+    with the previous block's keys forming the b-branch. When ``None``
+    (the first block), falls back to single-branch compression (equivalent
+    to the b-branch having -inf logits, contributing zero weight).
+
+    ``Bb_idx`` is the b-branch positional bias (mirrors ``Bb`` for the main
+    KV compression). When ``None``, ``B_idx`` is used for both branches
+    (backward-compatible default).
 
     Returns:
         ``[B, c_I]`` — one compressed indexer key.
@@ -583,10 +594,27 @@ def _indexer_compress_single(
     )
     K_idx_new = _to_dtype(K_idx_new, compute_dtype)
     Z_idx_new = _to_dtype(Z_idx_new, compute_dtype)
-    logits = Z_idx_new + _to_cache(
-        B_idx[None, :, :], Z_idx_new.dtype, Z_idx_new.device)   # [B, m, c_I]
-    S = torch.softmax(logits, dim=1)                            # [B, m, c_I]
-    return (S * K_idx_new).sum(1)                               # [B, c_I]
+    if Bb_idx is None:
+        Bb_idx = B_idx
+    if K_idx_prev is None or Z_idx_prev is None:
+        # First block: single-branch compression (no previous block).
+        logits = Z_idx_new + _to_cache(
+            B_idx[None, :, :], Z_idx_new.dtype, Z_idx_new.device)   # [B, m, c_I]
+        S = torch.softmax(logits, dim=1)                            # [B, m, c_I]
+        return (S * K_idx_new).sum(1)                               # [B, c_I]
+    # Overlapped two-branch compression: a-branch = current block,
+    # b-branch = previous block (mirrors csa_compress_kv_overlapped).
+    K_idx_prev = _to_dtype(K_idx_prev, compute_dtype)
+    Z_idx_prev = _to_dtype(Z_idx_prev, compute_dtype)
+    a_logits = Z_idx_new + _to_cache(
+        B_idx[None, :, :], Z_idx_new.dtype, Z_idx_new.device)    # [B, m, c_I]
+    b_logits = Z_idx_prev + _to_cache(
+        Bb_idx[None, :, :], Z_idx_prev.dtype, Z_idx_prev.device) # [B, m, c_I]
+    all_logits = torch.cat([a_logits, b_logits], dim=1)           # [B, 2m, c_I]
+    S = torch.softmax(all_logits, dim=1)                          # [B, 2m, c_I]
+    Sa = S[:, :m]                                                  # [B, m, c_I]
+    Sb = S[:, m:]                                                  # [B, m, c_I]
+    return (Sa * K_idx_new).sum(1) + (Sb * K_idx_prev).sum(1)     # [B, c_I]
 
 
 # =============================================================================
@@ -965,6 +993,11 @@ class CSADecodingCache:
         # NEXT block. ``None`` until the first block is completed.
         self._prev_Cb: torch.Tensor | None = None  # [B, m, c]
         self._prev_Zb: torch.Tensor | None = None  # [B, m, c]
+        # Previous block's K_idx / Z_idx for the overlapped indexer
+        # compression (mirrors _prev_Cb / _prev_Zb for the main KV;
+        # DeepSeek-V4 §2.3.1 requires the same compression for both).
+        self._prev_K_idx: torch.Tensor | None = None  # [B, m, c_I]
+        self._prev_Z_idx: torch.Tensor | None = None  # [B, m, c_I]
         # Compressed block caches use geometrically-grown storage. Only the
         # valid prefix is exposed through the public properties.
         self._C_comp: torch.Tensor | None = None   # [B, capacity, c]
@@ -1176,6 +1209,7 @@ class CSADecodingCache:
         Ba: torch.Tensor,        # [m, c]
         Bb: torch.Tensor,        # [m, c]
         B_idx: torch.Tensor,     # [m, c_I]
+        Bb_idx: torch.Tensor | None = None,  # [m, c_I] optional b-branch indexer bias
     ) -> list[int]:
         """Append ``T_new`` new tokens' projections to the cache.
 
@@ -1246,7 +1280,7 @@ class CSADecodingCache:
         if T_new > 1:
             return self._append_bulk(
                 Ca_new, Cb_new, Za_new, Zb_new, K_idx_new, Z_idx_new,
-                Ba, Bb, B_idx,
+                Ba, Bb, B_idx, Bb_idx,
             )
         new_block_indices: list[int] = []
         for i in range(T_new):
@@ -1321,9 +1355,13 @@ class CSADecodingCache:
                     Ca_block, Cb_block, Za_block, Zb_block,
                     self._prev_Cb, self._prev_Zb, Ba, Bb,
                 )                                                  # [B, c]
-                # Compress indexer keys (single-branch).
+                # Compress indexer keys (overlapped two-branch, matching
+                # the main KV compression; DeepSeek-V4 §2.3.1).
                 new_K_I = _indexer_compress_single(
                     K_idx_block, Z_idx_block, B_idx,
+                    K_idx_prev=self._prev_K_idx,
+                    Z_idx_prev=self._prev_Z_idx,
+                    Bb_idx=Bb_idx,
                 )                                                  # [B, c_I]
                 # Partial RoPE (§2.3.3): rotate the just-completed
                 # compressed KV entry at its block-anchor position
@@ -1369,6 +1407,10 @@ class CSADecodingCache:
                 # there the source is a view into the caller's tensor).
                 self._prev_Cb = Cb_block.detach()
                 self._prev_Zb = Zb_block.detach()
+                # Stash the just-consumed K_idx / Z_idx as the previous
+                # block's overlap partner for the NEXT indexer compression.
+                self._prev_K_idx = K_idx_block.detach()
+                self._prev_Z_idx = Z_idx_block.detach()
                 # Clear the accumulator for the next block.
                 self._acc_Ca.clear()
                 self._acc_Cb.clear()
@@ -1389,6 +1431,7 @@ class CSADecodingCache:
         Ba: torch.Tensor,
         Bb: torch.Tensor,
         B_idx: torch.Tensor,
+        Bb_idx: torch.Tensor | None = None,
     ) -> list[int]:
         """Batched ``append_step`` body for ``T_new > 1`` (prefill).
 
@@ -1470,7 +1513,10 @@ class CSADecodingCache:
             self._prev_Cb, self._prev_Zb, Ba, Bb,
         )                                                          # [B, c]
         new_K_first = _indexer_compress_single(
-            K_first, Zk_first, B_idx)                              # [B, c_I]
+            K_first, Zk_first, B_idx,
+            K_idx_prev=self._prev_K_idx,
+            Z_idx_prev=self._prev_Z_idx,
+            Bb_idx=Bb_idx)                              # [B, c_I]
         rest = T_new - first_needed
         n_rest = rest // m
         tail = rest % m
@@ -1502,13 +1548,19 @@ class CSADecodingCache:
             new_C_rest = _csa_compress_kv_overlapped_prev(
                 Ca_rest, Za_rest, Cb_prev_rest, Zb_prev_rest, Ba, Bb,
             )                                                      # [B, n_rest, c]
-            new_K_rest = csa_compress_kv(
+            new_K_rest = csa_compress_kv_overlapped(
+                K_idx_new[:, first_needed:rest_end].reshape(
+                    B, n_rest * m, self.c_I),
                 K_idx_new[:, first_needed:rest_end].reshape(
                     B, n_rest * m, self.c_I),
                 Z_idx_new[:, first_needed:rest_end].reshape(
                     B, n_rest * m, self.c_I),
-                B_idx, m,
+                Z_idx_new[:, first_needed:rest_end].reshape(
+                    B, n_rest * m, self.c_I),
+                B_idx, Bb_idx if Bb_idx is not None else B_idx, m,
             )                                                      # [B, n_rest, c_I]
+            last_K_idx = K_idx_new[:, rest_end - m:rest_end].reshape(B, m, self.c_I)
+            last_Z_idx = Z_idx_new[:, rest_end - m:rest_end].reshape(B, m, self.c_I)
             last_Cb = Cb_rest[:, -1]
             last_Zb = Zb_rest[:, -1]
         else:
@@ -1516,6 +1568,8 @@ class CSADecodingCache:
             new_K_rest = None
             last_Cb = Cb_first
             last_Zb = Zb_first
+            last_K_idx = K_first
+            last_Z_idx = Zk_first
         n_new = 1 + n_rest
         block_idx0 = self._n_blocks
         # Partial RoPE: rotate the just-completed compressed entries at
@@ -1550,6 +1604,9 @@ class CSADecodingCache:
         # compression (detached: decode must not retain the prefill graph).
         self._prev_Cb = last_Cb.detach().clone()
         self._prev_Zb = last_Zb.detach().clone()
+        # Same for the indexer's overlapped compression.
+        self._prev_K_idx = last_K_idx.detach().clone()
+        self._prev_Z_idx = last_Z_idx.detach().clone()
         # Leave the tokens past the last full block in the accumulator.
         if tail:
             self._acc_Ca = [t.clone() for t in
@@ -2023,6 +2080,7 @@ class CSADecodingCache:
         q_idx: torch.Tensor,
         w_idx: torch.Tensor,
         *,
+        Bb_idx: torch.Tensor | None = None,
         topk: int,
         nh: int,
         nIh: int,
@@ -2160,7 +2218,7 @@ class CSADecodingCache:
         # Advance the cache exactly as the per-token loop would.
         self.append_step(
             Ca_new, Cb_new, Za_new, Zb_new, K_idx_new, Z_idx_new,
-            Ba, Bb, B_idx)
+            Ba, Bb, B_idx, Bb_idx)
         t_pos = torch.arange(n0, n0 + T_new, device=self.device)
         q_compute = _to_dtype(q, compute_dtype)
         if self.rope_dim_eff > 0:

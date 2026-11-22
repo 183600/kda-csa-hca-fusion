@@ -1360,6 +1360,11 @@ class CSAHybridLayer(nn.Module):
         self.W_KV_idx = nn.Linear(d, cfg.csa_cI, bias=False)
         self.W_Z_idx = nn.Linear(d, cfg.csa_cI, bias=False)
         self.B_idx = nn.Parameter(torch.randn(cfg.csa_m, cfg.csa_cI) * cfg.init_std)
+        # b-branch positional bias for the indexer's overlapped two-branch
+        # compression (DeepSeek-V4 §2.3.1: the indexer uses the same
+        # compression operation as the main KV entries, which requires
+        # separate a/b positional biases). Mirrors self.Bb for the main KV.
+        self.Bb_idx = nn.Parameter(torch.randn(cfg.csa_m, cfg.csa_cI) * cfg.init_std)
         self.sink = nn.Parameter(torch.zeros(cfg.csa_nh))
         self.o_proj = nn.Linear(c * cfg.csa_nh, d, bias=False)
         # Separate sliding-window KV projection (DeepSeek-V4 §2.3.1).
@@ -1426,7 +1431,7 @@ class CSAHybridLayer(nn.Module):
             self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
             self.W_DQ.weight, self.W_UQ.weight, self.W_IUQ.weight,
             self.W_w.weight, self.W_KV_idx.weight, self.W_Z_idx.weight,
-            self.B_idx,
+            self.B_idx, Bb_idx=self.Bb_idx,
             m=cfg.csa_m, topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
             c=cfg.csa_c, c_I=cfg.csa_cI, dc=cfg.csa_dc,
             sliding_window=cfg.csa_sliding_window, sink_logits=self.sink,

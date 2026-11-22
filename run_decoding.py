@@ -856,6 +856,7 @@ class CSAAttnDecoding(nn.Module):
         self.W_KV_idx = nn.Linear(d, c_I, bias=False)
         self.W_Z_idx = nn.Linear(d, c_I, bias=False)
         self.B_idx = nn.Parameter(torch.randn(m, c_I) * 0.02)
+        self.Bb_idx = nn.Parameter(torch.randn(m, c_I) * 0.02)
         self.sink = nn.Parameter(torch.zeros(nh))
         self.o_proj = nn.Linear(c * nh, d, bias=False)
         # The decoding cache is created lazily on the first forward
@@ -933,7 +934,7 @@ class CSAAttnDecoding(nn.Module):
                 self.W_aZ.weight, self.W_bZ.weight, self.Ba, self.Bb,
                 self.W_DQ.weight, self.W_UQ.weight, self.W_IUQ.weight,
                 self.W_w.weight, self.W_KV_idx.weight, self.W_Z_idx.weight,
-                self.B_idx,
+                self.B_idx, Bb_idx=self.Bb_idx,
                 m=self.m, topk=self.topk, nh=self.nh, nIh=self.nIh,
                 c=self.c, c_I=self.c_I, dc=self.dc,
                 sliding_window=self.sliding_window, sink_logits=self.sink,
@@ -950,6 +951,7 @@ class CSAAttnDecoding(nn.Module):
                 Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
                 K_idx.detach(), Z_idx.detach(),
                 self.Ba.detach(), self.Bb.detach(), self.B_idx.detach(),
+                self.Bb_idx.detach(),
             )
             return self.o_proj(o)
         # Incremental path: T_new == 1 decode, or a continuation chunk
@@ -977,6 +979,7 @@ class CSAAttnDecoding(nn.Module):
             K_idx.detach(), Z_idx.detach(),
             self.Ba.detach(), self.Bb.detach(), self.B_idx.detach(),
             q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
+            Bb_idx=self.Bb_idx.detach(),
             topk=self.topk, nh=self.nh, nIh=self.nIh, scale=1.0,
             sink_logits=self.sink, use_ste=self.use_ste,
             normalize_qk=True,
@@ -1370,7 +1373,7 @@ class HybridDecoding(nn.Module):
                 layer.W_aZ.weight, layer.W_bZ.weight, layer.Ba, layer.Bb,
                 layer.W_DQ.weight, layer.W_UQ.weight, layer.W_IUQ.weight,
                 layer.W_w.weight, layer.W_KV_idx.weight, layer.W_Z_idx.weight,
-                layer.B_idx,
+                layer.B_idx, Bb_idx=layer.Bb_idx,
                 m=cfg.csa_m, topk=cfg.csa_topk, nh=cfg.csa_nh,
                 nIh=cfg.csa_nIh, c=cfg.csa_c, c_I=cfg.csa_cI,
                 dc=cfg.csa_dc, sliding_window=cfg.csa_sliding_window,
@@ -1385,6 +1388,7 @@ class HybridDecoding(nn.Module):
                 Ca.detach(), Cb.detach(), Za.detach(), Zb.detach(),
                 K_idx.detach(), Z_idx.detach(),
                 layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
+                layer.Bb_idx.detach(),
             )
         else:
             # Incremental path: T_new == 1 decode, or a continuation chunk
@@ -1410,6 +1414,7 @@ class HybridDecoding(nn.Module):
                 K_idx.detach(), Z_idx.detach(),
                 layer.Ba.detach(), layer.Bb.detach(), layer.B_idx.detach(),
                 q_n, q_idx.to(compute_dtype), w_idx.to(compute_dtype),
+                Bb_idx=layer.Bb_idx.detach(),
                 topk=cfg.csa_topk, nh=cfg.csa_nh, nIh=cfg.csa_nIh,
                 scale=None, sink_logits=layer.sink, use_ste=False,
                 normalize_qk=True,

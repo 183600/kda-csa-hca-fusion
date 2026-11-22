@@ -2168,6 +2168,7 @@ def naive_csa(
     W_Z_idx: torch.Tensor,         # [c_I, d]
     B_idx: torch.Tensor,           # [m, c_I]
     *,
+    Bb_idx: torch.Tensor | None = None,  # [m, c_I] optional b-branch positional bias; defaults to B_idx
     m: int,
     topk: int,
     nh: int,
@@ -2414,9 +2415,15 @@ def naive_csa(
     # axis, and a wrong-size sink would fail later inside ``.view`` with an
     # opaque error. Validate before the empty-sequence return so T=0 and
     # T>0 agree.
+    # Bb_idx defaults to B_idx for backward compatibility: callers that
+    # predate the overlapped indexer compression fix pass only B_idx, and
+    # the same bias is used for both branches of the overlapped compression.
+    if Bb_idx is None:
+        Bb_idx = B_idx
     for _b_name, _b, _b_shape in (
             ('Ba', Ba, (m, c)), ('Bb', Bb, (m, c)),
-            ('B_idx', B_idx, (m, c_I))):
+            ('B_idx', B_idx, (m, c_I)),
+            ('Bb_idx', Bb_idx, (m, c_I))):
         if tuple(_b.shape) != _b_shape:
             raise ValueError(
                 f'naive_csa: {_b_name}.shape={tuple(_b.shape)} does not '
@@ -2550,20 +2557,21 @@ def naive_csa(
             rope_dim_eff, rope_base, dim=1)
 
     # --- 2. Lightning indexer ---
-    # compressed indexer keys via the same compression operation, applied
-    # SINGLE-BRANCH (no a/b overlap). NOTE: the paper says CSA "performs
-    # the same compression operation used for CComp" — i.e. the overlapped
-    # two-branch compression — for the indexer keys as well; this reference
-    # implementation deliberately keeps a single branch (one W_KV_idx /
-    # W_Z_idx / B_idx instead of a/b pairs) as a documented simplification:
-    # the indexer only produces a top-k RANKING, which is robust to the
-    # compression variant. The RoPE is likewise NOT applied to the indexer
+    # Compressed indexer keys via the SAME overlapped two-branch compression
+    # as the main KV entries (DeepSeek-V4 §2.3.1: "performs the same
+    # compression operation used for CComp"). The indexer uses the same
+    # projection (K_idx_raw / Z_idx) for both the a-branch and b-branch
+    # (parameter-efficient: the indexer only produces a top-k RANKING,
+    # which is robust to the compression variant), but with SEPARATE
+    # learnable positional biases (B_idx for the a-branch, Bb_idx for the
+    # b-branch) so the overlapped compression can distinguish positions
+    # within each branch's window. The RoPE is NOT applied to the indexer
     # queries/keys — §2.3.3 scopes RoPE to the core-attention queries /
     # KV entries / outputs, not to the indexer scores (Eq. 15–16 have no
     # positional term).
     # K_idx_raw and Z_idx were computed in the merged matmul above.
-    K_IComp = csa_compress_kv(
-        K_idx_raw, Z_idx, B_idx, m,
+    K_IComp = csa_compress_kv_overlapped(
+        K_idx_raw, K_idx_raw, Z_idx, Z_idx, B_idx, Bb_idx, m,
         compress_chunk=compress_chunk)                               # [B, n_blocks, c_I]
     # indexer queries (low-rank)
     cQ = F.linear(H, W_DQ)                                        # [B, T, dc]
