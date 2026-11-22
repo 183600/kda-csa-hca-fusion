@@ -197,7 +197,11 @@ def test_csa_decoding_cache_compressed_blocks_match(device='cpu'):
         H, p, c, c_I, dc, nh, nIh)
     C_comp_full = csa_compress_kv_overlapped(
         Ca_f, Cb_f, Za_f, Zb_f, p['Ba'], p['Bb'], m)
-    K_IComp_full = csa_compress_kv(K_idx_f, Z_idx_f, p['B_idx'], m)
+    # The indexer uses the same overlapped two-branch compression as the
+    # main KV entries (DeepSeek-V4 §2.3.1). naive_csa defaults Bb_idx to
+    # B_idx, so both branches share B_idx here.
+    K_IComp_full = csa_compress_kv_overlapped(
+        K_idx_f, K_idx_f, Z_idx_f, Z_idx_f, p['B_idx'], p['B_idx'], m)
 
     # Incremental.
     cache = CSADecodingCache(B, c, c_I, m, win, device, torch.float32)

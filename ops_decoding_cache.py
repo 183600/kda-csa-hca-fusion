@@ -124,7 +124,8 @@ import torch
 
 from ops_cache import normal_tensor_scope
 from ops_rope import effective_rope_dim, partial_rope
-from ops_csa import (csa_compress_kv, _csa_compress_kv_overlapped_prev,
+from ops_csa import (csa_compress_kv, csa_compress_kv_overlapped,
+                     _csa_compress_kv_overlapped_prev,
                      csa_lightning_indexer, _l2_normalize, _qk_normalize,
                      _qk_normalize_, _nan_safe_softmax, _sink_softmax,
                      _require_scale)

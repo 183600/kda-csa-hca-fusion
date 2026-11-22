@@ -590,12 +590,19 @@ def test_csa_hca_sink_numerical_correctness(device='cpu'):
     # module level (line 48 imports csa_compress_kv_overlapped /
     # csa_lightning_indexer / _causal_block_mask / naive_csa). Import just
     # the missing name instead of re-shadowing the other three.
-    from ops_csa import csa_compress_kv
     Ca = F.linear(H, W_aKV); Cb = F.linear(H, W_bKV); Za = F.linear(H, W_aZ); Zb = F.linear(H, W_bZ)
     C_comp = csa_compress_kv_overlapped(Ca, Cb, Za, Zb, Ba, Bb, m)
     n_blocks = T // m
     K_idx_raw = F.linear(H, W_KV_idx); Z_idx = F.linear(H, W_Z_idx)
-    K_IComp = csa_compress_kv(K_idx_raw, Z_idx, B_idx, m)
+    # The indexer uses the SAME overlapped two-branch compression as the
+    # main KV entries (DeepSeek-V4 §2.3.1: "performs the same compression
+    # operation used for CComp"). naive_csa defaults Bb_idx to B_idx when
+    # not passed explicitly, so both branches share B_idx here.
+    K_IComp = csa_compress_kv_overlapped(
+        K_idx_raw, K_idx_raw, Z_idx, Z_idx, B_idx, B_idx, m)
+    # HCA uses single-branch compression (no overlap), so we still need
+    # csa_compress_kv for the HCA reference below.
+    from ops_csa import csa_compress_kv
     cQ = F.linear(H, W_DQ)
     q_idx = F.linear(cQ, W_IUQ).view(B, T, nIh, c_I)
     w_idx = F.linear(H, W_w)

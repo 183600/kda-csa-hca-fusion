@@ -70,7 +70,7 @@ def _build_param_groups(*modules, weight_decay=0.01):
     # because they are 2-D (so the ``ndim <= 1`` rule misses them) and
     # are not submodules of nn.Embedding/nn.LayerNorm (so the module-type
     # rule misses them too).
-    _POSITIONAL_BIAS_SUFFIXES = ('Ba', 'Bb', 'B_idx', 'B_pos')
+    _POSITIONAL_BIAS_SUFFIXES = ('Ba', 'Bb', 'B_idx', 'B_pos', 'Bb_idx')
 
     no_decay = []
     decay = []
