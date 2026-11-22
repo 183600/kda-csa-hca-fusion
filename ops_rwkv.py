@@ -688,6 +688,20 @@ class Rwkv7Mixer(nn.Module):
         # layer). This is the mixer's 'conv' slot in the hybrid stack's
         # lookback channel.
         self.register_buffer('_shift_state', None, persistent=False)
+        # Persistent RWKV-7 recurrent matrix state buffer of shape
+        # ``[B, H, K, V]``. This is REQUIRED for streaming / autoregressive
+        # decoding: without carrying the recurrent state between calls, each
+        # chunk starts from a zero state and loses all previously accumulated
+        # memory, producing incorrect outputs for every chunk after the first.
+        #
+        # The stateful ``forward()`` method reads this buffer when no
+        # explicit ``state`` argument is provided, and writes the updated
+        # state back after each call. ``forward_functional()`` takes the
+        # state as an explicit argument and does not touch this buffer.
+        #
+        # Registered as a non-persistent buffer (runtime state, not saved
+        # in checkpoints; reset between sequences via ``reset_conv_state``).
+        self.register_buffer('_rwkv_state', None, persistent=False)
 
     # ------------------------------------------------------------------
     # Initialization (upstream recipe, fla @ 074deaf)
@@ -772,14 +786,16 @@ class Rwkv7Mixer(nn.Module):
     # Streaming-state helpers
     # ------------------------------------------------------------------
     def reset_conv_state(self) -> None:
-        """Clear the persistent token-shift state.
+        """Clear the persistent token-shift state AND recurrent matrix state.
 
         Called between independent sequences (the stack's
         ``reset_state`` calls this for every memory layer) so the token
         shift does not "see" the previous sequence's last token as the
-        left context of the next one.
+        left context of the next one, and so the recurrent memory starts
+        fresh.
         """
         self._shift_state = None
+        self._rwkv_state = None
 
     def state_nbytes(self, batch: int = 1) -> dict:
         """Analytic per-layer runtime state size in bytes (fp32 states).
@@ -807,13 +823,31 @@ class Rwkv7Mixer(nn.Module):
                 state: torch.Tensor | None = None):
         """Stateful forward.
 
-        Reads ``self._shift_state`` and writes the new shift state back
-        to ``self``. Use :meth:`forward_functional` for the pure path
-        (DDP, ``torch.compile``, checkpointing, concurrent inference).
+        Reads ``self._shift_state`` and ``self._rwkv_state`` (when no
+        explicit ``state`` is given) and writes the new shift state and
+        recurrent state back to ``self``. This is the API used by
+        standalone callers and the experiment runners.
+
+        When ``state`` is ``None`` (the default), the recurrent state
+        is read from ``self._rwkv_state`` (persisted from the previous
+        call). The updated state is always written back to
+        ``self._rwkv_state`` so subsequent calls carry the memory forward.
+
+        For a **pure / side-effect-free** path (needed for DDP,
+        ``torch.compile``, checkpointing, and concurrent inference), use
+        :meth:`forward_functional` instead.
         """
+        # Auto-read the persisted recurrent state when the caller does
+        # not provide one explicitly. Without this, consecutive stateful
+        # calls (e.g. streaming / autoregressive decoding) would each
+        # start from a zero state, losing all previously accumulated
+        # memory.
+        if state is None:
+            state = self._rwkv_state
         o, new_state, new_shift = self.forward_functional(
             x, state, self._shift_state)
         self._shift_state = new_shift
+        self._rwkv_state = new_state
         return o, new_state
 
     def forward_functional(

@@ -1342,6 +1342,21 @@ class Mamba2Mixer(nn.Module):
         # as a non-persistent buffer so .to(device)/.half() move it and
         # state_dict skips it (runtime state, reset via reset_conv_state).
         self.register_buffer('_conv_lookback', None, persistent=False)
+        # Persistent SSM recurrent state buffer of shape
+        # ``[B, nheads, headdim, d_state]``. This is REQUIRED for streaming /
+        # autoregressive decoding: without carrying the SSM state between
+        # calls, each chunk starts from a zero state and loses all previously
+        # accumulated memory, producing incorrect outputs for every chunk
+        # after the first.
+        #
+        # The stateful ``forward()`` method reads this buffer when no
+        # explicit ``state`` argument is provided, and writes the updated
+        # state back after each call. ``forward_functional()`` takes the
+        # state as an explicit argument and does not touch this buffer.
+        #
+        # Registered as a non-persistent buffer (runtime state, not saved
+        # in checkpoints; reset between sequences via ``reset_conv_state``).
+        self.register_buffer('_ssm_state', None, persistent=False)
 
     def _init_dt(self) -> None:
         """Initialize ``dt_proj`` following the official Mamba-2 scheme.
@@ -1365,13 +1380,15 @@ class Mamba2Mixer(nn.Module):
     # Streaming-state helpers
     # ------------------------------------------------------------------
     def reset_conv_state(self) -> None:
-        """Clear the persistent short-conv state.
+        """Clear the persistent short-conv state AND SSM recurrent state.
 
         Called between independent sequences (the stack's ``reset_state``
         calls this for every memory layer) so the conv does not "see" tokens
-        from the previous sequence as left context.
+        from the previous sequence as left context, and so the SSM memory
+        starts fresh.
         """
         self._conv_lookback = None
+        self._ssm_state = None
 
     def state_nbytes(self, batch: int = 1) -> dict:
         """Analytic per-layer runtime state size in bytes (fp32 states).
@@ -1398,13 +1415,31 @@ class Mamba2Mixer(nn.Module):
                 state: torch.Tensor | None = None):
         """Stateful forward.
 
-        Reads ``self._conv_lookback`` and writes the new conv state back to
-        ``self``. Use :meth:`forward_functional` for the pure path (DDP,
-        ``torch.compile``, checkpointing, concurrent inference).
+        Reads ``self._conv_lookback`` and ``self._ssm_state`` (when no
+        explicit ``state`` is given) and writes the new conv state and
+        SSM state back to ``self``. This is the API used by standalone
+        callers and the experiment runners.
+
+        When ``state`` is ``None`` (the default), the SSM recurrent state
+        is read from ``self._ssm_state`` (persisted from the previous
+        call). The updated state is always written back to
+        ``self._ssm_state`` so subsequent calls carry the memory forward.
+
+        For a **pure / side-effect-free** path (needed for DDP,
+        ``torch.compile``, checkpointing, and concurrent inference), use
+        :meth:`forward_functional` instead.
         """
+        # Auto-read the persisted SSM state when the caller does not
+        # provide one explicitly. Without this, consecutive stateful
+        # calls (e.g. streaming / autoregressive decoding) would each
+        # start from a zero state, losing all previously accumulated
+        # memory.
+        if state is None:
+            state = self._ssm_state
         o, new_state, new_conv = self.forward_functional(
             x, state, self._conv_lookback)
         self._conv_lookback = new_conv
+        self._ssm_state = new_state
         return o, new_state
 
     def forward_functional(
