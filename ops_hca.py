@@ -226,12 +226,19 @@ def naive_hca(
     # temperature for the paper-form 'rms' mode. When normalize_qk is False,
     # vectors are NOT normalized so we use 1/sqrt(c) regardless of mode.
     # An explicit ``scale=`` is always honoured.
+    #
+    # Consistency with CSA: ``naive_csa`` uses ``scale=1.0`` for the 'l2'
+    # mode (cosine attention — unit-norm vectors have dot products in
+    # [-1, 1], so the natural temperature is 1.0). Using ``c ** -0.5``
+    # with L2-normalized vectors over-shrinks the scores and makes the
+    # softmax nearly uniform, defeating the learned attention pattern.
     if scale is None:
         if not normalize_qk:
             scale = c ** -0.5
         elif qk_norm_mode == 'rms':
             scale = c ** -0.5
         else:
+            # 'l2' mode: cosine attention, temperature 1.0 (matches CSA).
             scale = 1.0
 
     # Query-axis tiling for the dense score / joint-softmax / value
