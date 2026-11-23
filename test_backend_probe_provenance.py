@@ -706,8 +706,14 @@ def test_csa_overlapped_recompression_across_chunkings(device='cpu'):
         Ca_f[:, :n_full * m], Cb_f[:, :n_full * m],
         Za_f[:, :n_full * m], Zb_f[:, :n_full * m],
         p['Ba'], p['Bb'], m)
-    expected_K = csa_compress_kv(
-        K_idx_f[:, :n_full * m], Z_idx_f[:, :n_full * m], p['B_idx'], m)
+    # The indexer uses the SAME overlapped two-branch compression as the
+    # main KV entries (DeepSeek-V4 §2.3.1; see naive_csa's K_IComp call).
+    # Both branches share K_idx_raw / Z_idx (parameter-efficient), and
+    # Bb_idx defaults to B_idx when not explicitly provided.
+    expected_K = csa_compress_kv_overlapped(
+        K_idx_f[:, :n_full * m], K_idx_f[:, :n_full * m],
+        Z_idx_f[:, :n_full * m], Z_idx_f[:, :n_full * m],
+        p['B_idx'], p['B_idx'], m)
 
     def build(chunks):
         cache = CSADecodingCache(B, c, c_I, m, win, device, torch.float32)

@@ -1558,8 +1558,16 @@ class CSADecodingCache:
             # block 1 onward. This caused the bf16 decode-vs-prefill
             # parity test to fail (top-k selection diverged at block 1+,
             # producing ~100x the expected tolerance on some seeds).
-            K_first_flat = K_first.reshape(B, m, self.c_I)
-            Zk_first_flat = Zk_first.reshape(B, m, self.c_I)
+            # Detach the first block's indexer projections to match the
+            # per-token loop, which stashes ``_prev_K_idx`` / ``_prev_Z_idx``
+            # with ``detach()``.  Without this, the chunked path routes
+            # gradients from later blocks' indexer compression back into
+            # the first block's K_idx / Z_idx projections, while the
+            # token-by-token path treats those as constants; forward
+            # values are identical either way, but the gradient graphs
+            # disagree.
+            K_first_flat = K_first.detach().reshape(B, m, self.c_I)
+            Zk_first_flat = Zk_first.detach().reshape(B, m, self.c_I)
             K_rest_with_prev = torch.cat(
                 [K_first_flat,
                  K_idx_new[:, first_needed:rest_end].reshape(
